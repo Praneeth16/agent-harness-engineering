@@ -1,0 +1,6 @@
+
+[dev]
+pytest
+nbclient
+nbformat
+ipykernel

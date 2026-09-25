@@ -30,8 +30,12 @@ def observations(run):
     return [e for e in run.events
             if e["kind"] == "observation"]
 def pending_for(run):
+    obs = observations(run)
+    terms = {t.lower() for e in obs
+             for t in e.get("terms", [])}
     return {"searched": any(e.get("tool") == "search_notes"
-                            for e in observations(run)),
+                            for e in obs),
+            "searched_terms": sorted(terms),
             "unread_hits": sorted(run.hits - run.seen),
             "unfinished": unfinished(run),
             "problems": dict(run.problems),

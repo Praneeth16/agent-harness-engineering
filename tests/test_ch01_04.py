@@ -183,6 +183,17 @@ def test_stale_result_cannot_complete_a_run():
     assert "cannot finish: ['no_anticoag']" in run.events[-1]["error"]
 
 
+def test_packet_matches_chapter_2_for_a_completed_run():
+    run = ch03.run_task(P041, ch03.fake_planner)
+    pk = ch03.packet(run)
+    assert pk["status"] == "completed" and pk["unfinished"] == []
+    assert pk["protocol"] == "T004 v3" and pk["review"] == "pending"
+    assert pk["criteria"]["no_anticoag"].status == "not met"
+    blocked = ch03.packet(ch03.run_task(P041, ch03.eager))
+    assert blocked["status"] == "blocked"
+    assert blocked["unfinished"] == ["age", "marker", "no_anticoag"]
+
+
 def test_unread_matches_appear_in_the_reason():
     run = ch03.start(P041)
     ch03.t_search(run, ch03.SEARCH_TERMS)

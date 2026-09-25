@@ -64,7 +64,7 @@ def t_search(run, terms):
     if set(hits) - run.hits:
         run.changed["anticoagulant"] = len(run.events)
     run.hits.update(hits)
-    return {"notes": hits}
+    return {"terms": terms, "notes": hits}
 def t_read(run, note_id, reader):
     if run.reads >= run.budget.reads:
         raise BudgetExhausted("read budget spent")
@@ -201,6 +201,15 @@ def run_task(req, planner, reader=fake_reader, budget=None,
     except ContractError as why:
         return {"status": "refused", "reason": str(why)}
     return drive(run, planner, reader, context)
+
+def packet(run):
+    # Chapter 2's packet, from a run in any end state.
+    p = run.protocol
+    return {"status": run.state, "reason": run.reason,
+            "protocol": f"{p.study} v{p.version}",
+            "criteria": dict(run.results),
+            "unfinished": unfinished(run),
+            "review": "pending"}
 # end listing
 
 # listing 3.6
@@ -286,6 +295,28 @@ def hasty(context):      # evaluates first, reads, finishes
 def broken_reader(context):
     raise RuntimeError("model endpoint timed out")
 # end listing
+
+
+PLANNER_PROMPT = """You choose the next step of a screening run. Reply with JSON only:
+{"tool": name, "args": {...}}. Tools:
+- search_notes {"terms": [up to 5 strings]}: ids of the patient's notes containing any term
+- read_note {"note_id": id}: a reader extracts a dated statement about anticoagulants
+- evaluate_rule {"rule_id": id}: computes the rule's status from the evidence so far
+- finish {}: ends the run; refused while any rule lacks a current result
+Rule no_anticoag means: no anticoagulant therapy within 180 days. Notes may name drugs by
+brand. Read only notes that matter; reads are limited. Evaluate every rule, then finish.
+Run so far:
+"""
+
+
+def live_planner(context):
+    # The notebook's live planner: the same context dict, through chat().
+    import json
+    from .ch01 import chat, parse_json
+    try:
+        return parse_json(chat(PLANNER_PROMPT + json.dumps(context, default=str)))
+    except ValueError:
+        return {"tool": None}
 
 
 # Chapter 3 data: P041 has nine notes over a year, two about

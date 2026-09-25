@@ -189,6 +189,26 @@ def evaluate_note_rule(rule, notes, on, model):
 # end listing
 
 
+def live_reader(context):
+    # The notebook's live reader: the same contract as fake_reader, through
+    # Chapter 1's chat(). Not printed; the prompt is described in Section 2.5.
+    from .ch01 import chat, parse_json
+    prompt = (
+        "You read one clinical note and report what it says about one field.\n"
+        f"Field: {context['field']}\n"
+        "Reply with JSON only: {\"field\": the field, \"status\": \"present\"|"
+        "\"absent\"|\"unclear\"|\"none\", \"observed\": \"YYYY-MM-DD\" or null, "
+        "\"quote\": the exact sentence from the note that supports the status}.\n"
+        "present: the patient is on it. absent: the note says the patient is not. "
+        "unclear: mentioned but not settled. none: not mentioned.\n"
+        f"Note: {context['note']}")
+    try:
+        return parse_json(chat(prompt))
+    except ValueError:
+        return {"field": context["field"], "status": "none",
+                "observed": None, "quote": ""}
+
+
 # Records, notes, and fixtures for Table 2.3. Data, not printed as code.
 D = date
 RECORDS = {
