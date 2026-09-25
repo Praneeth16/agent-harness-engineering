@@ -5,7 +5,7 @@ from datetime import timedelta
 from .ch03 import *            # noqa: F401,F403
 from .ch03 import (D, NOTES, PROTOCOLS, RECORDS, SEARCH_TERMS, SPEC,
                    TOOLS, BudgetExhausted, Evidence, Note, Budget,
-                   request, run_task, start, drive, unfinished)
+                   request, run_task, start, drive, unfinished, words)
 
 # listing 4.1
 import hashlib, json
@@ -29,13 +29,17 @@ def describe(rule, protocol):
 def observations(run):
     return [e for e in run.events
             if e["kind"] == "observation"]
+def searched_terms(run):
+    asked = [e["proposal"] for e in run.events
+             if e["kind"] == "proposal"]
+    terms = [p.get("args", {}).get("terms") for p in asked
+             if isinstance(p, dict)
+             and p.get("tool") == "search_notes"]
+    return sorted({t.lower() for ts in terms if words(ts)
+                   for t in ts})
 def pending_for(run):
-    obs = observations(run)
-    terms = {t.lower() for e in obs
-             for t in e.get("terms", [])}
-    return {"searched": any(e.get("tool") == "search_notes"
-                            for e in obs),
-            "searched_terms": sorted(terms),
+    return {"searched": bool(searched_terms(run)),
+            "searched_terms": searched_terms(run),
             "unread_hits": sorted(run.hits - run.seen),
             "unfinished": unfinished(run),
             "problems": dict(run.problems),
@@ -143,6 +147,17 @@ def exit_test(run, want_unread, limits):
 
 def context_v2(run):
     return assemble(run)
+
+
+def context_without_terms(run):
+    # Experiment condition B in Section 4.5: the assembled bundle as first
+    # built, before the pending block listed the terms already searched.
+    ctx = build(run)
+    del ctx["pending"]["searched_terms"]
+    text = json.dumps(ctx, default=str)
+    run.record("context", chars=len(text), recent=len(ctx["recent"]),
+               sha=hashlib.sha256(text.encode()).hexdigest()[:12], bundle=ctx)
+    return ctx
 
 
 # Chapter 4 data: P042 has thirty notes over a year; P044 describes

@@ -40,6 +40,8 @@ class Recorder:
 
     def __call__(self, prompt):
         env = os.environ
+        if env.get("AHE_LIVE") != "1":
+            raise RuntimeError("set AHE_LIVE=1 to call a model")
         body = {"model": env["AHE_MODEL"],
                 "messages": [{"role": "user", "content": prompt}],
                 "usage": {"include": True}}
@@ -51,14 +53,20 @@ class Recorder:
             {"Content-Type": "application/json",
              "Authorization": "Bearer " + env["AHE_API_KEY"]})
         started = time.time()
-        with urllib.request.urlopen(req, timeout=180) as reply:
-            out = json.load(reply)
-        content = out["choices"][0]["message"]["content"]
+        try:
+            with urllib.request.urlopen(req, timeout=180) as reply:
+                out = json.load(reply)
+        except Exception as why:          # failed calls are records too
+            self._write({"experiment": self.experiment, "at": _now(),
+                         "requested_model": body["model"], "prompt": prompt,
+                         "error": f"{type(why).__name__}: {why}",
+                         "seconds": round(time.time() - started, 2)})
+            raise
+        content = out["choices"][0]["message"].get("content") or ""
         usage = out.get("usage", {})
-        with self.path.open("a") as f:
-            f.write(json.dumps({
+        self._write({
                 "experiment": self.experiment,
-                "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                "at": _now(),
                 "requested_model": body["model"],
                 "served_model": out.get("model"),
                 "provider": out.get("provider"),
@@ -70,12 +78,21 @@ class Recorder:
                 "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
                 "cost_usd": usage.get("cost"),
                 "seconds": round(time.time() - started, 2),
-            }) + "\n")
+            })
         return content
 
+    def _write(self, record):
+        with self.path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
 
-def records(experiment):
+
+def _now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def records(experiment, include_errors=False):
     path = RUNS / f"{experiment}.jsonl"
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text().splitlines()]
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    return rows if include_errors else [r for r in rows if "error" not in r]

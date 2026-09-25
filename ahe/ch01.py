@@ -9,7 +9,7 @@ PROTOCOLS = {("T004", 2): {"age": (18, 65),
                            "marker": (3, 7)}}
 
 def read_record(patient_id):
-    return RECORDS[patient_id]
+    return dict(RECORDS[patient_id])  # a copy
 
 def criterion(value, lower, upper):
     if value is None:
@@ -46,12 +46,17 @@ def check_claim(claim, results):
     omitted = sorted(set(results) - set(named))
     if omitted:
         return "claim omits " + ", ".join(omitted)
+    invented = sorted(set(named) - set(results))
+    if invented:
+        return "claim invents " + ", ".join(invented)
     wrong = sorted(n for n in results
                    if named[n] != results[n])
     if wrong:
         return "claim contradicts " + ", ".join(wrong)
-    eligible = claim.get("eligible")
-    if eligible not in (True, False, None):
+    if "eligible" not in claim:
+        return "claim has no eligible field"
+    eligible = claim["eligible"]
+    if eligible is not None and type(eligible) is not bool:
         return "eligible is not true, false, or null"
     statuses = set(results.values())
     if eligible is True and statuses != {"met"}:
@@ -65,12 +70,15 @@ def harnessed(task, model=fake_model):
     rules = PROTOCOLS[task["protocol"]]
     results = {name: criterion(record[name], *bounds)
                for name, bounds in rules.items()}
-    claim = model({"record": record, "rules": rules})
-    problem = check_claim(claim, results)
-    summary = None if problem else claim.get("summary")
+    claim = model({"record": dict(record),
+                   "rules": dict(rules)})
+    open_items = {name: "no value recorded"
+                  for name, s in results.items()
+                  if s == "unknown"}
     return {"protocol": task["protocol"],
-            "criteria": results, "summary": summary,
-            "rejected": problem, "review": "pending"}
+            "criteria": results, "open": open_items,
+            "claim_rejected": check_claim(claim, results),
+            "review": "pending"}
 
 task = {"patient": "P017", "protocol": ("T004", 2)}
 # end listing
@@ -82,6 +90,8 @@ def chat(prompt):
     # Any OpenAI-compatible endpoint: OpenRouter, a
     # Databricks workspace, a local server.
     env = os.environ
+    if env.get("AHE_LIVE") != "1":
+        raise RuntimeError("set AHE_LIVE=1 to call a model")
     url = env["AHE_BASE_URL"].rstrip("/")
     url += "/chat/completions"
     body = {"model": env["AHE_MODEL"], "messages":
@@ -92,7 +102,7 @@ def chat(prompt):
          "Authorization": "Bearer " + env["AHE_API_KEY"]})
     with urllib.request.urlopen(req, timeout=120) as reply:
         choice = json.load(reply)["choices"][0]
-    return choice["message"]["content"]
+    return choice["message"].get("content") or ""
 
 def parse_json(text):
     # Models often wrap JSON in prose or a code fence.

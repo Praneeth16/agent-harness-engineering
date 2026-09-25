@@ -64,7 +64,7 @@ def t_search(run, terms):
     if set(hits) - run.hits:
         run.changed["anticoagulant"] = len(run.events)
     run.hits.update(hits)
-    return {"terms": terms, "notes": hits}
+    return {"notes": hits}
 def t_read(run, note_id, reader):
     if run.reads >= run.budget.reads:
         raise BudgetExhausted("read budget spent")

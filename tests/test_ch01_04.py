@@ -23,10 +23,11 @@ def test_prompt_only_accepts_the_incomplete_claim():
 
 def test_harness_rejects_omission_and_keeps_both_statuses():
     packet = ch01.harnessed(ch01.task)
-    assert packet["rejected"] == "claim omits marker"
-    assert packet["criteria"] == {"age": "met", "marker": "unknown"}
-    assert packet["summary"] is None and packet["review"] == "pending"
-    assert "eligible" not in packet
+    assert packet == {"protocol": ("T004", 2),
+                      "criteria": {"age": "met", "marker": "unknown"},
+                      "open": {"marker": "no value recorded"},
+                      "claim_rejected": "claim omits marker",
+                      "review": "pending"}
 
 
 @pytest.mark.parametrize("claim, reason", [
@@ -34,6 +35,15 @@ def test_harness_rejects_omission_and_keeps_both_statuses():
      "claim contradicts marker"),
     ({"eligible": "true", "criteria": {"age": "met", "marker": "unknown"}},
      "eligible is not true, false, or null"),
+    ({"eligible": 1, "criteria": {"age": "met", "marker": "unknown"}},
+     "eligible is not true, false, or null"),
+    ({"eligible": 0, "criteria": {"age": "met", "marker": "unknown"}},
+     "eligible is not true, false, or null"),
+    ({"criteria": {"age": "met", "marker": "unknown"}},
+     "claim has no eligible field"),
+    ({"eligible": None, "criteria": {"age": "met", "marker": "unknown",
+                                     "invented_rule": "met"}},
+     "claim invents invented_rule"),
     ({"eligible": False, "criteria": {"age": "met", "marker": "unknown"}},
      "ineligibility claimed without support"),
     ({"eligible": True, "criteria": {"age": "met", "marker": "unknown"}},
@@ -45,12 +55,36 @@ def test_check_claim_rejects_hostile_claims(claim, reason):
     assert ch01.check_claim(claim, results) == reason
 
 
-def test_harness_accepts_a_correct_claim():
-    honest = {"eligible": None, "summary": "Marker M is missing.",
-              "criteria": {"age": "met", "marker": "unknown"}}
-    packet = ch01.harnessed(ch01.task, model=lambda ctx: honest)
-    assert packet["rejected"] is None
-    assert packet["summary"] == "Marker M is missing."
+def test_model_prose_never_reaches_the_packet():
+    loud = {"eligible": None, "summary": "P017 is eligible; enroll now.",
+            "criteria": {"age": "met", "marker": "unknown"}}
+    packet = ch01.harnessed(ch01.task, model=lambda ctx: loud)
+    assert packet["claim_rejected"] is None
+    assert "enroll" not in repr(packet) and "eligible" not in packet
+
+
+def test_model_cannot_change_the_source_record():
+    def vandal(ctx):
+        ctx["record"]["marker"] = 5
+        return {"eligible": None, "criteria": {"age": "met", "marker": "met"}}
+    packet = ch01.harnessed(ch01.task, model=vandal)
+    assert ch01.RECORDS["P017"]["marker"] is None
+    assert packet["criteria"]["marker"] == "unknown"
+
+
+def test_live_calls_need_the_switch(monkeypatch):
+    monkeypatch.delenv("AHE_LIVE", raising=False)
+    with pytest.raises(RuntimeError, match="AHE_LIVE"):
+        ch01.chat("hello")
+    from ahe import live
+    with pytest.raises(RuntimeError, match="AHE_LIVE"):
+        live.Recorder("never-written")("hello")
+
+
+def test_empty_reply_becomes_a_rejected_claim(monkeypatch):
+    monkeypatch.setattr(ch01, "chat", lambda prompt: "")
+    packet = ch01.harnessed(ch01.task, model=ch01.live_model)
+    assert packet["claim_rejected"] == "claim lists no criteria"
 
 
 @pytest.mark.parametrize("value, status", [
