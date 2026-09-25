@@ -54,8 +54,10 @@ def start(req, budget=None):
 # end listing
 
 # listing 3.2
-def notes_of(run):
-    return NOTES.get(run.request["patient"], [])
+def notes_of(run):          # only notes written by the day
+    on = run.request["on"]
+    return [n for n in NOTES.get(run.request["patient"], [])
+            if n.written <= on]
 
 def t_search(run, terms):
     low = [t.lower() for t in terms]
@@ -71,7 +73,8 @@ def t_read(run, note_id, reader):
     run.reads += 1
     run.seen.add(note_id)
     note = next(n for n in notes_of(run) if n.id == note_id)
-    item, problem = read_note(reader, note, "anticoagulant")
+    item, problem = read_note(reader, note, "anticoagulant",
+                              run.request["on"])
     run.changed["anticoagulant"] = len(run.events)
     if item is None:
         if problem != "no statement in note":
@@ -125,7 +128,11 @@ def gate(run, proposal):
     if not isinstance(args, dict) or set(args) != names:
         return f"{tool} takes {sorted(names)}"
     for name, ok in SPEC[tool].items():
-        if not ok(run, args[name]):
+        try:
+            fine = ok(run, args[name])
+        except Exception:        # a check that cannot run
+            fine = False         # refuses; it never crashes
+        if not fine:
             return f"bad value for {name}: {args[name]!r}"
     return None
 # end listing
@@ -150,7 +157,17 @@ def unfinished(run):
             > run.computed[r.id]]
 
 def step(run, planner, reader, context=context_for):
-    proposal = planner(context(run))
+    ctx = context(run)
+    have = 2 if "pending" in ctx else 1  # v2: Chapter 4
+    want = getattr(planner, "context_schema", have)
+    if want != have:
+        raise ContractError(
+            f"planner expects context v{want}, "
+            f"harness gives v{have}")
+    proposal = planner(ctx)
+    if isinstance(proposal, dict):  # keep only what may run
+        proposal = {k: proposal[k] for k in ("tool", "args")
+                    if k in proposal}
     run.record("proposal", proposal=proposal)
     refusal = gate(run, proposal)
     if refusal:
@@ -231,7 +248,7 @@ def fixed_screen(req, reader=fake_reader):
 # listing 3.7
 BRANDS = ["eliquis", "coumadin", "blood thinner"]
 
-def fake_planner(context):
+def fake_planner(context):         # reads context v1
     # Stand-in for a model choosing the next step. It takes
     # the rules in order, searches before it reads, and
     # searches again with brand names if the first finds
@@ -259,6 +276,7 @@ def fake_planner(context):
         return {"tool": "evaluate_rule",
                 "args": {"rule_id": rule_id}}
     return {"tool": "finish"}
+fake_planner.context_schema = 1
 # end listing
 
 # listing 3.8

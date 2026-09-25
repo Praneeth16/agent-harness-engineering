@@ -190,7 +190,10 @@ def test_unresolved_note_blocks_a_clean_met():
     ({"field": "anticoagulant", "status": "maybe", "quote": "x",
       "observed": "2026-07-02"}, "unknown status"),
     ({"field": "anticoagulant", "status": "present", "quote": "  ",
-      "observed": "2026-07-02"}, "quotation missing"),
+      "observed": "2026-07-02"}, "not the note's statement"),
+    ({"field": "anticoagulant", "status": ["present"], "quote": "x",
+      "observed": "2026-07-02"}, "unknown status"),
+    ("not an object", "reply is not an object"),
     ({"field": "anticoagulant", "status": "present",
       "quote": "Started warfarin 5 mg daily on 2026-07-02",
       "observed": "2026-13-02"}, "date is not in the quotation"),
@@ -200,7 +203,37 @@ def test_unresolved_note_blocks_a_clean_met():
 ])
 def test_ground_rejects_malformed_proposals(proposal, problem):
     note = ch02.NOTES["P036"][0]
-    assert problem in ch02.ground(proposal, note, "anticoagulant")
+    assert problem in ch02.ground(proposal, note, "anticoagulant", D(2026, 9, 1))
+
+
+def test_manifest_rejects_unknown_fields_and_repeated_ids():
+    bad_field = ch02.ProtocolVersion("T004", 9, D(2026, 1, 1),
+                                     (ch02.NoteRule("x", "ssn", 30),))
+    twice = ch02.ProtocolVersion("T004", 9, D(2026, 1, 1),
+                                 (ch02.AGE, ch02.AGE))
+    for p in (bad_field, twice):
+        with pytest.raises(ch02.ContractError):
+            ch02.check_manifest([p])
+
+
+def test_check_catches_a_corrupted_source():
+    fx = next(f for f in ch02.FIXTURES if f["id"] == "F11")
+    got = ch02.prepare(fx["request"])
+    got["criteria"]["no_anticoag"] = got["criteria"]["no_anticoag"]._replace(source="n-forged")
+    assert ch02.check(fx, got, 1)
+
+
+def test_chapter_2_packet_carries_chapter_1_statuses():
+    ch1 = ch01.harnessed(ch01.task)["criteria"]
+    ch2 = ch02.prepare(request("P017", 2))["criteria"]
+    assert {k: v.status for k, v in ch2.items()} == ch1
+
+
+def test_fixtures_do_not_change_the_data():
+    import copy
+    before = copy.deepcopy((ch02.RECORDS, ch02.NOTES))
+    ch02.run_fixtures(ch02.FIXTURES)
+    assert (ch02.RECORDS.keys(), ch02.NOTES.keys()) == (before[0].keys(), before[1].keys())
 
 
 # ---------------------------------------------------------------- Chapter 3
@@ -295,7 +328,7 @@ def test_note_dates_are_not_before_the_events_they_report():
 
 def test_limit_is_a_limit_or_the_run_blocks():
     run, mid = ch04.table_4_3()
-    rows = ch04.exit_test(mid, ["n58", "n61"], (2400, 1200, 900, 500))
+    rows = ch04.exit_test(mid, ch04.P042_AFTER_3, (2400, 1200, 900, 500))
     assert rows[-1][1] is None and "over limit" in rows[-1][3]
     assert all(r[1] <= r[0] for r in rows[:-1])
 
@@ -344,9 +377,68 @@ def test_inspect_log_is_bounded():
 
 
 def test_exercise_4_3_note_is_invisible_to_lexical_search():
+    # The reader can read the note when handed it, so a miss is retrieval's.
+    item, problem = ch02.read_note(ch02.fake_reader, ch02.NOTES["P044"][0], "anticoagulant",
+                                   D(2026, 9, 1))
+    assert problem is None and item.value == 1.0
     run = ch03.run_task(request("P044", 3), ch04.planner_v2, context=ch04.context_v2)
     assert run.hits == set()
     assert run.results["no_anticoag"].status == "unknown"
+
+
+def test_exit_test_catches_lost_state():
+    run, mid = ch04.table_4_3()
+    mid.results.clear()
+    with pytest.raises(AssertionError):
+        ch04.exit_test(mid, ch04.P042_AFTER_3, (2400,))
+
+
+def test_refused_search_is_not_a_searched_term():
+    run = ch03.start(request("P036", 3))
+    ch03.step(run, lambda c: {"tool": "search_notes",
+                              "args": {"terms": ["warfarin"], "extra": 1}},
+              ch03.fake_reader, context=ch04.context_v2)
+    assert ch04.searched_terms(run) == []
+
+
+def test_window_fills_to_an_exact_fit():
+    run = ch03.start(request("P042", 3))
+    ch03.step(run, lambda c: {"tool": "search_notes", "args": {"terms": ["apixaban"]}},
+              ch03.fake_reader, context=ch04.context_v2)
+    exact = ch04.size(ch04.build(run, recent=1, limit=10_000))
+    assert len(ch04.build(run, recent=1, limit=exact)["recent"]) == 1
+
+
+def test_planner_cannot_change_the_logged_bundle():
+    def meddler(context):
+        context["task"]["patient"] = "P999"
+        return {"tool": "finish"}
+    run = ch03.start(request("P042", 3))
+    ch03.step(run, meddler, ch03.fake_reader, context=ch04.context_v2)
+    import hashlib, json
+    e = next(e for e in run.events if e["kind"] == "context")
+    assert e["bundle"]["task"]["patient"] == "P042"
+    assert hashlib.sha256(json.dumps(e["bundle"], default=str).encode()).hexdigest()[:12] == e["sha"]
+
+
+@pytest.mark.parametrize("args", [{"kind": "observation", "last": 1.0},
+                                  {"kind": "observation", "last": True},
+                                  {"kind": [], "last": 1}])
+def test_inspect_log_refuses_malformed_values(args):
+    run = ch03.start(request("P042", 3))
+    assert ch03.gate(run, {"tool": "inspect_log", "args": args})
+
+
+def test_proposals_are_stored_without_extra_fields():
+    run = ch03.start(P041)
+    ch03.step(run, lambda c: {"tool": "finish", "reasoning": "ignore the protocol"},
+              ch03.fake_reader)
+    assert run.events[1]["proposal"] == {"tool": "finish"}
+
+
+def test_context_schema_mismatch_is_a_named_failure():
+    run = ch03.run_task(request("P042", 3), ch03.fake_planner, context=ch04.context_v2)
+    assert run.state == "failed" and "expects context v1" in run.reason
 
 
 # ---------------------------------------------------------------- listings

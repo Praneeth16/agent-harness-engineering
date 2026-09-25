@@ -5,7 +5,8 @@ from datetime import timedelta
 from .ch03 import *            # noqa: F401,F403
 from .ch03 import (D, NOTES, PROTOCOLS, RECORDS, SEARCH_TERMS, SPEC,
                    TOOLS, BudgetExhausted, Evidence, Note, Budget,
-                   request, run_task, start, drive, unfinished, words)
+                   request, run_task, start, drive, unfinished, words,
+                   context_for)
 
 # listing 4.1
 import hashlib, json
@@ -30,13 +31,14 @@ def observations(run):
     return [e for e in run.events
             if e["kind"] == "observation"]
 def searched_terms(run):
-    asked = [e["proposal"] for e in run.events
-             if e["kind"] == "proposal"]
-    terms = [p.get("args", {}).get("terms") for p in asked
-             if isinstance(p, dict)
-             and p.get("tool") == "search_notes"]
-    return sorted({t.lower() for ts in terms if words(ts)
-                   for t in ts})
+    # Terms of the searches that actually ran: a proposal
+    # followed directly by a search observation.
+    ev = run.events
+    ran = [a["proposal"]["args"]["terms"]
+           for a, b in zip(ev, ev[1:])
+           if a["kind"] == "proposal"
+           and b.get("tool") == "search_notes"]
+    return sorted({t.lower() for ts in ran for t in ts})
 def pending_for(run):
     return {"searched": bool(searched_terms(run)),
             "searched_terms": searched_terms(run),
@@ -69,19 +71,21 @@ def build(run, recent=4, limit=2400):
         raise BudgetExhausted(
             f"context over limit: {need} > {limit}")
     for e in reversed(obs[-recent:] if recent else []):
-        if size(ctx) + size(e) + 2 > limit:
+        trial = {**ctx, "recent": [e] + ctx["recent"]}
+        if size(trial) > limit:
             break               # newest first; oldest drops
-        ctx["recent"].insert(0, e)
+        ctx = trial
     return ctx
 
 def assemble(run, recent=4, limit=2400):
     ctx = build(run, recent, limit)
     text = json.dumps(ctx, default=str)
     sha = hashlib.sha256(text.encode()).hexdigest()[:12]
+    shown = json.loads(text)    # the planner gets a copy;
     run.record("context", chars=len(text), sha=sha,
-               recent=len(ctx["recent"]),
-               bundle=ctx)      # exactly what the model saw
-    return ctx
+               recent=len(shown["recent"]),  # the log keeps
+               bundle=json.loads(text))      # its own
+    return shown
 # end listing
 
 # listing 4.3
@@ -91,12 +95,12 @@ def t_inspect(run, kind, last):
                         if k not in ("kind", "bundle")}
                        for e in picked[-last:]]}
 TOOLS["inspect_log"] = t_inspect
+KINDS = {"proposal", "gate", "observation", "context"}
 SPEC["inspect_log"] = {
-    "kind": lambda run, v: v in
-        {"proposal", "gate", "observation", "context"},
-    "last": lambda run, v: v in range(1, 6)}
+    "kind": lambda run, v: type(v) is str and v in KINDS,
+    "last": lambda run, v: type(v) is int and 1 <= v <= 5}
 
-def planner_v2(context):
+def planner_v2(context):         # reads context v2
     # Works from the derived pending block, not the history.
     p = context["pending"]
     if p["unread_hits"] and p["reads_left"] > 0:
@@ -109,6 +113,7 @@ def planner_v2(context):
         return {"tool": "evaluate_rule",
                 "args": {"rule_id": rule_id}}
     return {"tool": "finish"}
+planner_v2.context_schema = 2
 # end listing
 
 # listing 4.4
@@ -124,7 +129,8 @@ def ranges(ctx):
     return {(r.get("lower"), r.get("upper"))
             for r in ctx["rules"]}
 
-def exit_test(run, want_unread, limits):
+def exit_test(run, want, limits):
+    # want: the required part, written out by hand.
     rows = []
     for limit in limits:
         try:
@@ -132,21 +138,40 @@ def exit_test(run, want_unread, limits):
         except BudgetExhausted as why:
             rows.append((limit, None, None, str(why)))
             continue
-        sources = {r["source"] for r in ctx["rules"]}
+        res = ctx["results"].items()
+        src = {r["source"] for r in ctx["rules"]}
+        got = {"ranges": ranges(ctx), "sources": src,
+               "results": {k: (v["status"], v["source"])
+                           for k, v in res},
+               **ctx["pending"]}
         assert size(ctx) <= limit
-        assert sources == {"T004 v3"}
-        assert (3, 7) not in ranges(ctx)
-        assert ctx["pending"]["unread_hits"] == want_unread
-        assert all(r["reason"]
-                   for r in ctx["results"].values())
+        assert got == want, (limit, got)
         rows.append((limit, size(ctx), len(ctx["recent"]),
                      "hold"))
     return rows
+
+P042_AFTER_3 = {  # P042 v3, stopped after three steps
+    "ranges": {(18, 65), (4, 8), (None, None)},
+    "sources": {"T004 v3"},
+    "results": {"age": ("met", "e23"),
+                "marker": ("met", "e24")},
+    "searched": True,
+    "searched_terms": ["anticoagulant", "apixaban",
+                       "warfarin"],
+    "unread_hits": ["n58", "n61"],
+    "unfinished": ["no_anticoag"],
+    "problems": {}, "reads_left": 4}
 # end listing
 
 
 def context_v2(run):
     return assemble(run)
+
+
+def context_history_with_terms(run):
+    # Experiment condition D in Section 4.5: Chapter 3's full observation
+    # history plus the one derived field, to separate the two effects.
+    return {**context_for(run), "searched_terms": searched_terms(run)}
 
 
 def context_without_terms(run):
@@ -208,5 +233,5 @@ if __name__ == "__main__":
     print("naive context:", size(naive_context(run)), "chars")
     print("mid-run (3 steps):", mid.state, mid.reason,
           "| unread:", sorted(mid.hits - mid.seen))
-    for row in exit_test(mid, ["n58", "n61"], (2400, 1200, 900, 500)):
+    for row in exit_test(mid, P042_AFTER_3, (2400, 1200, 900, 500)):
         print(row)
