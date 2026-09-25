@@ -232,7 +232,8 @@ def judge_note_rule(rule, found, problems, on):
         return Result("met", f"absence stated {f.observed}",
                       f.id, f.quote)
     if recent:
-        why = f"absence does not cover {rule.window_days} days"
+        days = rule.window_days
+        why = f"absence does not cover {days} days"
         return Result("unknown", why, recent[-1].id)
     return Result("unknown", "no grounded statement")
 
