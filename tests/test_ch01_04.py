@@ -23,7 +23,7 @@ def test_prompt_only_accepts_the_incomplete_claim():
 
 def test_harness_rejects_omission_and_keeps_both_statuses():
     packet = ch01.harnessed(ch01.task)
-    assert packet == {"protocol": ("T004", 2),
+    assert packet == {"patient": "P017", "protocol": ("T004", 2),
                       "criteria": {"age": "met", "marker": "unknown"},
                       "open": {"marker": "no value recorded"},
                       "claim_rejected": "claim omits marker",
@@ -70,6 +70,47 @@ def test_model_cannot_change_the_source_record():
     packet = ch01.harnessed(ch01.task, model=vandal)
     assert ch01.RECORDS["P017"]["marker"] is None
     assert packet["criteria"]["marker"] == "unknown"
+
+
+def test_nested_record_fields_cannot_be_changed(monkeypatch):
+    monkeypatch.setitem(ch01.RECORDS, "P018", {"age": 47, "marker": None,
+                                               "meta": {"consent": "missing"}})
+    def vandal(ctx):
+        ctx["record"]["meta"]["consent"] = "granted"
+        return {}
+    ch01.harnessed({"patient": "P018", "protocol": ("T004", 2)}, model=vandal)
+    assert ch01.RECORDS["P018"]["meta"]["consent"] == "missing"
+
+
+def test_packets_name_their_patient(monkeypatch):
+    monkeypatch.setitem(ch01.RECORDS, "P018", {"age": 47, "marker": None})
+    a = ch01.harnessed(ch01.task)
+    b = ch01.harnessed({"patient": "P018", "protocol": ("T004", 2)})
+    assert a != b and a["patient"] == "P017" and b["patient"] == "P018"
+
+
+@pytest.mark.parametrize("reply", [[], 7, None, "no json", '{"criteria": 3}'])
+def test_unusable_claims_are_rejected_not_raised(reply):
+    packet = ch01.harnessed(ch01.task, model=lambda ctx: reply)
+    assert packet["claim_rejected"]
+
+
+@pytest.mark.parametrize("body", [{"choices": []}, {"choices": [{"message": {"content": 7}}]},
+                                   {"choices": [{"message": {}}]}])
+def test_chat_turns_malformed_responses_into_empty_text(monkeypatch, body):
+    import io, json as _json
+    monkeypatch.setenv("AHE_LIVE", "1")
+    monkeypatch.setenv("AHE_BASE_URL", "http://example.invalid")
+    monkeypatch.setenv("AHE_API_KEY", "k")
+    monkeypatch.setenv("AHE_MODEL", "m")
+    class Reply(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(ch01.urllib.request, "urlopen",
+                        lambda req, timeout: Reply(_json.dumps(body).encode()))
+    assert ch01.chat("hi") == ""
+    packet = ch01.harnessed(ch01.task, model=ch01.live_model)
+    assert packet["claim_rejected"] == "claim lists no criteria"
 
 
 def test_live_calls_need_the_switch(monkeypatch):

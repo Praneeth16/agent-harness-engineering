@@ -58,15 +58,27 @@ class Recorder:
                 out = json.load(reply)
         except Exception as why:          # failed calls are records too
             self._write({"experiment": self.experiment, "at": _now(),
-                         "requested_model": body["model"], "prompt": prompt,
-                         "error": f"{type(why).__name__}: {why}",
+                         "endpoint": url, "requested_model": body["model"],
+                         "prompt": prompt, "error": f"{type(why).__name__}: {why}",
                          "seconds": round(time.time() - started, 2)})
             raise
-        content = out["choices"][0]["message"].get("content") or ""
-        usage = out.get("usage", {})
+        usage = out.get("usage") or {}
+        try:
+            content = out["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            content = None
+        if not isinstance(content, str):   # unusable: keep the raw reply
+            self._write({"experiment": self.experiment, "at": _now(),
+                         "endpoint": url, "requested_model": body["model"],
+                         "prompt": prompt, "error": "unusable reply",
+                         "raw": out, "cost_usd": usage.get("cost"),
+                         "seconds": round(time.time() - started, 2)})
+            return ""
         self._write({
                 "experiment": self.experiment,
                 "at": _now(),
+                "endpoint": url,
+                "code_version": _code_version(),
                 "requested_model": body["model"],
                 "served_model": out.get("model"),
                 "provider": out.get("provider"),
@@ -84,6 +96,15 @@ class Recorder:
     def _write(self, record):
         with self.path.open("a") as f:
             f.write(json.dumps(record) + "\n")
+
+
+def _code_version():
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", str(RUNS.parent), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=5).stdout.strip() or None
+    except Exception:
+        return None
 
 
 def _now():

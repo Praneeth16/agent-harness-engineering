@@ -4,12 +4,14 @@ Listings 1.1 to 1.3 of the book are the marked regions below.
 """
 
 # listing 1.1
+from copy import deepcopy
+
 RECORDS = {"P017": {"age": 47, "marker": None}}
 PROTOCOLS = {("T004", 2): {"age": (18, 65),
                            "marker": (3, 7)}}
 
 def read_record(patient_id):
-    return dict(RECORDS[patient_id])  # a copy
+    return deepcopy(RECORDS[patient_id])  # never the source
 
 def criterion(value, lower, upper):
     if value is None:
@@ -40,6 +42,8 @@ def prompt_only(task, model=fake_model):
     return model(context)  # the answer is the result
 
 def check_claim(claim, results):
+    if not isinstance(claim, dict):
+        return "claim is not an object"
     named = claim.get("criteria")
     if not isinstance(named, dict):
         return "claim lists no criteria"
@@ -70,12 +74,13 @@ def harnessed(task, model=fake_model):
     rules = PROTOCOLS[task["protocol"]]
     results = {name: criterion(record[name], *bounds)
                for name, bounds in rules.items()}
-    claim = model({"record": dict(record),
-                   "rules": dict(rules)})
+    claim = model(deepcopy({"record": record,
+                            "rules": rules}))
     open_items = {name: "no value recorded"
                   for name, s in results.items()
                   if s == "unknown"}
-    return {"protocol": task["protocol"],
+    return {"patient": task["patient"],
+            "protocol": task["protocol"],
             "criteria": results, "open": open_items,
             "claim_rejected": check_claim(claim, results),
             "review": "pending"}
@@ -101,11 +106,17 @@ def chat(prompt):
         {"Content-Type": "application/json",
          "Authorization": "Bearer " + env["AHE_API_KEY"]})
     with urllib.request.urlopen(req, timeout=120) as reply:
-        choice = json.load(reply)["choices"][0]
-    return choice["message"].get("content") or ""
+        out = json.load(reply)
+    try:
+        text = out["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return ""             # an unusable reply
+    return text if isinstance(text, str) else ""
 
 def parse_json(text):
     # Models often wrap JSON in prose or a code fence.
+    if not isinstance(text, str):
+        raise ValueError("reply is not text")
     start, end = text.find("{"), text.rfind("}")
     return json.loads(text[start:end + 1])
 
