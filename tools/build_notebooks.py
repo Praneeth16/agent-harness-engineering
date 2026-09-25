@@ -48,6 +48,8 @@ def notebook(title, intro, cells):
     nb = nbf.v4.new_notebook()
     nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3", "language": "python"}
     nb.cells = [md(f"# {title}\n\n{intro}"), md("## Setup"), code(SETUP)] + cells
+    for i, cell in enumerate(nb.cells):
+        cell.id = f"cell-{i:02d}"     # stable ids, so regenerating changes nothing
     return nb
 
 
