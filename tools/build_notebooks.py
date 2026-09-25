@@ -134,10 +134,13 @@ print(len(FIXTURES), "fixtures pass.")'''),
         code('''from pprint import pprint
 pprint(prepare(request("P036", 3)))'''),
         md("## 3. The hostile readers against `ground`"),
-        code('''note = NOTES["P036"][0]
-for reader in (ch02.fake_reader, ch02.liar, ch02.forger, ch02.drifter, ch02.redater):
+        code('''from datetime import date
+on = date(2026, 9, 1)
+note = NOTES["P036"][0]
+for reader in (ch02.fake_reader, ch02.liar, ch02.forger, ch02.drifter, ch02.redater,
+               ch02.flipper, ch02.fragment, ch02.hider, ch02.garbler):
     proposal = reader({"note": note.text, "field": "anticoagulant"})
-    print(f"{reader.__name__:12s} -> {ground(proposal, note, 'anticoagulant') or 'grounded'}")'''),
+    print(f"{reader.__name__:12s} -> {ground(proposal, note, 'anticoagulant', on) or 'grounded'}")'''),
         md("## 4. The recorded live reader (Table 2.2)"),
         code('''from collections import Counter
 from ahe import ch01, live
@@ -150,7 +153,7 @@ for r in recs:
         p = ch01.parse_json(r["reply"])
     except ValueError:
         p = {}
-    tally[(pid, p.get("status"), ground(p, n, "anticoagulant") or "grounded")] += 1
+    tally[(pid, p.get("status"), ground(p, n, "anticoagulant", date(2026, 9, 1)) or "grounded")] += 1
 for k, v in sorted(tally.items()):
     print(k, v)
 print(len(recs), "calls; cost $%.4f" % sum(r["cost_usd"] for r in recs))'''),
@@ -190,7 +193,7 @@ print(evaluate_2_2(marker, readings, date(2026, 9, 1)))'''),
         code('''from ahe.ch02 import Note, read_note
 tricky = Note("n99", date(2026, 8, 1),
               "Warfarin was considered on 2026-08-01 and rejected because of bleeding risk.")
-print(read_note(ch02.fake_reader, tricky, "anticoagulant"))'''),
+print(read_note(ch02.fake_reader, tricky, "anticoagulant", date(2026, 9, 1)))'''),
     ])
 
 
@@ -267,7 +270,7 @@ CH4 = notebook(
 from ahe.ch03 import request, run_task, Budget
 run, mid = ch04.table_4_3()
 print("naive:", ch04.size(ch04.naive_context(run)), "chars")
-for row in ch04.exit_test(mid, ["n58", "n61"], (2400, 1200, 900, 500)):
+for row in ch04.exit_test(mid, ch04.P042_AFTER_3, (2400, 1200, 900, 500)):
     print(row)'''),
         md("## 2. What the model saw at one step"),
         code('''from pprint import pprint
@@ -275,7 +278,7 @@ run = run_task(request("P042", 3), ch04.planner_v2, context=ch04.context_v2)
 ctx = [e for e in run.events if e["kind"] == "context"][3]
 print(ctx["sha"], ctx["chars"], "chars")
 pprint(ctx["bundle"]["pending"])'''),
-        md("## 3. Replay the three-context experiment (Table 4.4)"),
+        md("## 3. Replay the four-context experiment (Table 4.4)"),
         code('''from ahe import ch01, live
 def replay(experiment, pid, context, n=5):
     replies = iter(r["reply"] for r in live.records(experiment))
@@ -288,7 +291,8 @@ def replay(experiment, pid, context, n=5):
             for _ in range(n)]
 for pid in ("P042", "P043"):
     for tag, context in (("naive", ch03.context_for), ("assembled", ch04.context_without_terms),
-                         ("terms", ch04.context_v2)):
+                         ("terms", ch04.context_v2),
+                         ("historyterms", ch04.context_history_with_terms)):
         runs = replay(f"ch04_{pid.lower()}_{tag}_gpt-6-luna", pid, context)
         done = sum(r.state == "completed" for r in runs)
         print(pid, f"{tag:10s} completed {done}/5, steps", [r.count("proposal") for r in runs])'''),
@@ -301,18 +305,35 @@ for pid in ("P042", "P043"):
     print(r.state, r.reason, r.count("proposal"), "steps")
 else:
     print("Set AHE_LIVE=1 to run the live planner on the assembled context.")'''),
-        md("## Exercise solutions\n\n### Exercise 4.1\n\n`fake_planner` reads `context[\"observations\"]`, which the assembled bundle does not have, so the run fails with a `KeyError`. It is a broken contract, not a bug on either side: the planner assumed the Chapter 3 schema. A planner is entitled to the fields a versioned context schema promises, and nothing else."),
+        md("## Exercise solutions\n\n### Exercise 4.1\n\nThe run fails with a named reason, because `fake_planner` declares context version 1. An adapter can map `recent` to `observations`, but it cannot fill `observations` honestly: version 1 promised every observation, and the window holds only the last few. The adapter should say so, for example by adding the archive count, rather than pretend the list is complete."),
         code('''r = run_task(request("P042", 3), ch03.fake_planner, context=ch04.context_v2)
+print(r.state, r.reason)
+
+def as_v1(bundle):
+    return {"task": bundle["task"], "rules": [x["id"] for x in bundle["rules"]],
+            "results": {k: v["status"] for k, v in bundle["results"].items()},
+            "observations": bundle["recent"], "steps_left": bundle["steps_left"],
+            "observations_omitted": bundle["archive"]["observations"] - len(bundle["recent"])}
+def adapted(context):
+    return ch03.fake_planner(as_v1(context))
+adapted.context_schema = 2
+r = run_task(request("P042", 3), adapted, context=ch04.context_v2)
 print(r.state, r.reason)'''),
-        md("### Exercise 4.2\n\nThe invariant: no sentence of any note appears in the bundle. Returning the quotation from `t_read` would put note text into observations and so into the recent window, which Section 2.5's contract keeps out: only grounded statements enter. A reviewer would see the same packet, but the log would show note text reaching the planner."),
+        md("### Exercise 4.2\n\nThe invariant: no note sentence appears in the bundle unless it is a grounded quotation in `results`. Returning the whole note from `t_read` puts every sentence into observations and so into the window. The reviewer would see the same packet; the log would show the planner being handed text no contract checked."),
         code('''import json
-def no_note_text(run, ctx):
-    text = json.dumps(ctx, default=str)
-    return not any(n.text[:30] in text for n in ch04.NOTES[run.request["patient"]])
+from ahe.ch02 import sentences
+def no_ungrounded_text(run, ctx):
+    quotes = {v["quote"] for v in ctx["results"].values() if v.get("quote")}
+    text = json.dumps(ctx["recent"], default=str)
+    return not any(s in text for n in ch04.NOTES[run.request["patient"]]
+                   for s in sentences(n.text) if s not in quotes and len(s) > 20)
 run = run_task(request("P042", 3), ch04.planner_v2, context=ch04.context_v2)
-print(all(no_note_text(run, e["bundle"]) for e in run.events if e["kind"] == "context"))'''),
-        md("### Exercise 4.3\n\nLexical search with the listed terms finds nothing, and the rule stays `unknown`. A fixture that justifies vector search would state that n70 is relevant, that a search for anticoagulants must return it, and that `ground` must still find the quotation and date in the note, because a similarity match is not a reading."),
-        code('''r = run_task(request("P044", 3), ch04.planner_v2, context=ch04.context_v2)
+print(all(no_ungrounded_text(run, e["bundle"]) for e in run.events if e["kind"] == "context"))'''),
+        md("### Exercise 4.3\n\nHanded the note, the stand-in reader grounds it as `present`, so the reader is not the problem. Lexical search with the listed terms never returns it, and the rule stays `unknown`. A fixture that justifies vector search states that n70 is relevant, that a search for anticoagulants must return it, and that `ground` must still find the quotation and date in the note, because a similarity match is not a reading."),
+        code('''from datetime import date
+from ahe.ch02 import read_note, fake_reader
+print(read_note(fake_reader, ch04.NOTES["P044"][0], "anticoagulant", date(2026, 9, 1)))
+r = run_task(request("P044", 3), ch04.planner_v2, context=ch04.context_v2)
 print(r.hits, r.results["no_anticoag"])'''),
     ])
 
