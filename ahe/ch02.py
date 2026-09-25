@@ -70,7 +70,7 @@ def check_manifest(protocols):
     for p in protocols:
         ids = [r.id for r in p.rules]
         if len(ids) != len(set(ids)):
-            raise ContractError(f"v{p.version}: repeated id")
+            raise ContractError(f"v{p.version}: same id")
         for r in p.rules:
             if r.field not in VOCABULARY or (
                     isinstance(r, NoteRule)
