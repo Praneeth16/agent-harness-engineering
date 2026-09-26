@@ -350,7 +350,7 @@ def test_exit_test_holds_on_both_patients():
     for pid in ("P042", "P043"):
         rows = ch05.exit_test(request(pid, 3))
         assert len(rows) == len(ch05.HOSTILE)
-        assert all(err != "accepted" for _, err, _, _ in rows)
+        assert all(err != "accepted" for _, err, *_ in rows)
 
 
 def test_exit_test_fails_without_authorization(monkeypatch):
@@ -395,3 +395,109 @@ def test_a_tool_that_raises_under_mcp_is_an_error_result():
 def test_ready_stops_when_the_principal_cannot_submit():
     with pytest.raises(ValueError, match="completed before a submit"):
         ch05.ready(Harness(REVIEWER_A, Submissions()), P042)
+
+
+# ---------------------------------------------------------------- chapter review, round 1
+
+def test_exit_test_fails_when_only_the_study_check_is_removed(monkeypatch):
+    real = ch05.authorize
+    def no_study_check(principal, tool, run):
+        wide = ch05.Principal(principal.name, principal.studies | {run.protocol.study},
+                              principal.may_submit)
+        return real(wide, tool, run)
+    monkeypatch.setattr(ch05, "authorize", no_study_check)
+    with pytest.raises(AssertionError, match="coordinator-9|accepted"):
+        ch05.exit_test(P042)
+
+
+@pytest.mark.parametrize("args", [[], False, 0, "", {"x": 1}])
+def test_finish_takes_exactly_no_arguments(args):
+    h = Harness(COORDINATOR, Submissions())
+    assert h.admit(start(P042), {"tool": "finish", "args": args})["error"] == "finish got arguments"
+
+
+def test_an_off_study_principal_cannot_finish_a_run():
+    run = ch05.ready(Harness(COORDINATOR, Submissions()), P042)
+    out = Harness(ch05.OFF_STUDY, Submissions()).dispatch(run, {"tool": "finish"})
+    assert out["error"] == "coordinator-9 not on T004" and run.state == "running"
+
+
+def test_a_different_packet_for_the_same_request_is_a_conflict():
+    backend = Submissions()
+    first = Harness(COORDINATOR, backend).run(P042, planner_v5)
+    def says_unclear(ctx):
+        return {"status": "unclear", "date": None, "quote": None}
+    second = Harness(COORDINATOR, backend, reader=says_unclear).run(P042, planner_v5)
+    assert first.results["no_anticoag"].status != second.results["no_anticoag"].status
+    assert len(backend.stored) == 1 and getattr(second, "receipt", None) is None
+    assert any(e.get("refused", {}).get("error", "").startswith("conflicts with")
+               or e.get("error", "").startswith("conflicts with") for e in second.events)
+
+
+def test_an_after_hook_cannot_change_what_the_caller_gets():
+    def tamper(run, tool, args, principal, result):
+        result["submitted"] = "S9999"
+    run = Harness(COORDINATOR, Submissions(), after=[tamper]).run(P042, planner_v5)
+    assert run.receipt == "S0001"
+    shown = [e for e in run.events if e.get("tool") == "submit_packet"]
+    assert shown and all(e["submitted"] == "S0001" for e in shown)
+
+
+def test_long_argument_names_get_bounded_refusals():
+    problem = check_args(start(P042), ch05.SEARCH, {"terms": ["x"], "page": 1, "y" * 10_000: 1})
+    assert len(problem["error"]) < 100
+
+
+@pytest.mark.parametrize("terms, ok", [
+    (["atrial fibrillation"], True), (["a"] * 5, True), (["a"] * 6, False),
+    (["x" * 41], False), ([" "], False), ([], False)])
+def test_search_terms_are_what_the_tool_text_says(terms, ok):
+    problem = check_args(start(P042), ch05.SEARCH, {"terms": terms, "page": 1})
+    assert (problem is None) == ok
+    assert f"up to {ch05.TERM_CHARS} characters" in ch05.SEARCH.params[0].doc
+
+
+def test_an_oversized_proposal_is_refused_and_not_logged_whole():
+    h = Harness(COORDINATOR, Submissions())
+    run = start(P042)
+    out = h.dispatch(run, {"tool": "search_notes", "args": {"terms": ["x"], "page": 1, "z" * 5000: 0}})
+    assert out["error"] == "proposal too large"
+    assert all(len(json.dumps(e)) < 1000 for e in run.events)
+
+
+def test_only_submit_packet_commits():
+    h = Harness(COORDINATOR, Submissions())
+    assert {n for n, t in h.tools.items() if t.effect == "commit"} == {"submit_packet"}
+    assert {t.effect for t in h.tools.values()} == {"read", "propose", "commit"}
+
+
+def test_a_draft_needs_every_rule_current():
+    out = ch05.draft(start(P042))
+    assert out["error"] == "draft refused" and "not current" in out["why"]
+
+
+def test_skill_instructions_reach_the_live_planner(monkeypatch):
+    from ahe import ch01
+    seen = []
+    monkeypatch.setattr(ch01, "chat", lambda prompt: seen.append(prompt) or '{"tool": "finish"}')
+    skill = ch05.load_skill(ROOT / "skills/screen-anticoagulant-notes/SKILL.md")
+    h = ch05.with_skill(Harness(COORDINATOR, Submissions()), skill)
+    h.step(start(P042), ch05.live_planner5(h))
+    assert skill.body and skill.body in seen[0]
+
+
+def test_mcp_rejects_bad_envelopes_before_any_tool_runs():
+    from ahe import mcp_server
+    backend, out = Submissions(), []
+    run = ch05.ready(Harness(COORDINATOR, backend), P042)
+    server = mcp_server.Server(Harness(COORDINATOR, backend), run)
+    before = backend.calls
+    msgs = [{"jsonrpc": "1.0", "id": 1, "method": "tools/call",
+             "params": {"name": "submit_packet", "arguments": {}}},
+            {"id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": [1]},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+             "params": {"name": "submit_packet", "arguments": []}}]
+    server.serve([json.dumps(m) for m in msgs], lambda s: out.append(json.loads(s)))
+    assert [r["error"]["code"] for r in out] == [-32600, -32600, -32600, -32602]
+    assert backend.calls == before

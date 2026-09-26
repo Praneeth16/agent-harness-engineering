@@ -43,7 +43,7 @@ def check_args(run, tool, args):
     given = sorted(map(str, args))
     if given != names or not all(type(k) is str
                                  for k in args):
-        return refuse(f"{tool.name} got {given}",
+        return refuse(f"{tool.name} got {preview(given)}",
                       f"it takes exactly {names}",
                       f"send {names} and nothing else")
     for p in tool.params:
@@ -67,6 +67,7 @@ def preview(v, n=60):       # bounded, and safe to print
 # end listing
 
 PAGE = 3                       # search results per page
+TERMS, TERM_CHARS = 5, 40      # what search_notes accepts
 
 
 # listing 5.2
@@ -83,6 +84,11 @@ def search(run, terms, page):
     return {"notes": shown, "page": page,
             "more": len(hits) > start + PAGE}
 
+def terms_ok(run, v):
+    return 1 <= len(v) <= TERMS and all(
+        type(t) is str and 0 < len(t.strip()) <= TERM_CHARS
+        for t in v)
+
 def in_run(ids):
     return lambda run, v: v in ids(run)
 
@@ -93,9 +99,10 @@ SEARCH = Tool("search_notes", "read",
     "Find this patient's notes that contain any of the "
     "terms. Returns note ids, 3 per page, and whether "
     "there are more.",
-    (Param("terms", list, "1 to 5 words to look for",
-           lambda run, v: words(v),
-           'e.g. ["warfarin", "apixaban"]'),
+    (Param("terms", list, f"1 to {TERMS} words or "
+           f"phrases, each up to {TERM_CHARS} characters",
+           terms_ok,
+           'e.g. ["warfarin", "atrial fibrillation"]'),
      Param("page", int, "page of results, from 1",
            lambda run, v: v >= 1, "start at 1")), search)
 READ = Tool("read_note", "read",
@@ -114,6 +121,7 @@ EVALUATE = Tool("evaluate_rule", "read",
 # end listing
 
 READ_TOOLS = (SEARCH, READ, EVALUATE)
+FINISH = Tool("finish", "read", "End the run.", (), None)
 
 
 def describe(tools, full=True):
@@ -130,8 +138,9 @@ def describe(tools, full=True):
 
 # listing 5.3
 class Submissions:
-    # The system the packet goes to. It stores a packet
-    # once per key and returns the same receipt after that.
+    # The system the packet goes to: one packet per key.
+    # The same packet again gets the same receipt; a
+    # different packet under a used key is a conflict.
     def __init__(self):
         self.stored, self.calls = {}, 0
 
@@ -140,7 +149,8 @@ class Submissions:
         if key not in self.stored:
             receipt = f"S{len(self.stored) + 1:04d}"
             self.stored[key] = (receipt, text)
-        return self.stored[key][0]
+        receipt, kept = self.stored[key]
+        return receipt, kept == text
 
 def digest(packet):
     text = json.dumps(packet, sort_keys=True, default=str)
@@ -171,10 +181,14 @@ def submit(run, backend):
     text = json.dumps(run.draft, sort_keys=True,
                       default=str)
     r, p = run.request, run.protocol   # the version used
-    key = (f"{r['patient']}:{p.study}:{p.version}:"
-           f"{r['on']}:{digest(run.draft)}")
-    run.receipt = backend.submit(key, text)
-    return {"submitted": run.receipt}
+    key = f"{r['patient']}:{p.study}:{p.version}:{r['on']}"
+    receipt, same = backend.submit(key, text)
+    if not same:
+        return refuse(f"conflicts with {receipt}",
+                      "this request has another packet",
+                      "leave it for a coordinator")
+    run.receipt = receipt
+    return {"submitted": receipt}
 # end listing
 
 
@@ -254,6 +268,8 @@ class Harness:
 
 
 # listing 5.5
+MAX_PROPOSAL = 2000            # characters, serialized
+
 def visible(h, run):
     # The planner is shown only the tools it may call, and
     # a skill can narrow that list but never widen it.
@@ -269,11 +285,17 @@ def admit(h, run, proposal):
         return refuse("proposal is not an object",
                       "a proposal names a tool and its "
                       "args", shape)
+    if proposal.get("oversize"):
+        return refuse("proposal too large",
+                      f"over {MAX_PROPOSAL} characters",
+                      "send one short proposal")
     name = proposal.get("tool")
     if name == "finish":
-        return None if not proposal.get("args") else refuse(
-            "finish got arguments", "it takes none",
-            "send {\"tool\": \"finish\"}")
+        if proposal.get("args", {}) != {}:
+            return refuse("finish got arguments",
+                          "it takes none",
+                          'send {"tool": "finish"}')
+        return authorize(h.principal, FINISH, run)
     if type(name) is not str or name not in h.tools:
         return refuse(f"no tool {preview(name)}",
                       f"tools: {visible(h, run)}",
@@ -309,6 +331,8 @@ def dispatch(h, run, proposal):
     if isinstance(proposal, dict):
         proposal = {k: proposal[k] for k in ("tool", "args")
                     if k in proposal}
+    if len(preview(proposal, MAX_PROPOSAL)) > MAX_PROPOSAL:
+        proposal = {"oversize": True}  # not logged whole
     run.record("proposal", proposal=proposal)
     problem = admit(h, run, proposal)
     if problem:
@@ -324,7 +348,8 @@ def dispatch(h, run, proposal):
     run.record("observation", tool=name, **out)
     for hook in h.after:   # the call already happened
         try:
-            hook(run, tool, args, h.principal, out)
+            hook(run, tool, args, h.principal,
+                 deepcopy(out))        # a copy to read
         except Exception as why:
             run.record("hook_failed", tool=name,
                        error=f"{type(why).__name__}: {why}")
@@ -445,6 +470,7 @@ planner_v5.context_schema = 2
 REVIEWER_A = Principal("reviewer-a", frozenset({"T004"}))
 COORDINATOR = Principal("coordinator-1", frozenset({"T004"}), may_submit=True)
 OUTSIDER = Principal("reviewer-b", frozenset({"T009"}))
+OFF_STUDY = Principal("coordinator-9", frozenset({"T009"}), may_submit=True)
 
 
 # The exit test: calls that must not reach the backend or the reader.
@@ -479,6 +505,11 @@ HOSTILE = (   # (case, principal, harness options, proposal, change to the run)
     ("another patient's note", COORDINATOR, {}, {"tool": "read_note", "args": {"note_id": "n25"}}, None),
     ("reviewer submits", REVIEWER_A, {}, SUBMIT, None),
     ("other study", OUTSIDER, {}, SUBMIT, None),
+    ("other study's coordinator", OFF_STUDY, {}, SUBMIT, None),
+    ("other study finishes", OFF_STUDY, {}, {"tool": "finish"}, None),
+    ("finish with arguments", COORDINATOR, {}, {"tool": "finish", "args": []}, None),
+    ("oversized proposal", COORDINATOR, {},
+     {"tool": "read_note", "args": {"note_id": "n58", "x" * 3000: 1}}, None),
     ("hook vetoes", COORDINATOR, {"before": (no_commits,)}, SUBMIT, None),
     ("outside the skill", COORDINATOR, {"skill": READ_ONLY}, SUBMIT, None),
     ("stale draft", COORDINATOR, {}, SUBMIT, stale),
@@ -503,8 +534,8 @@ def ready(h, req):
     raise ValueError(f"run {run.state} before a submit")
 
 def attempt(req, case):
-    # Returns what the call got, and how many backend
-    # calls and reader calls it caused.
+    # Returns what the call got, the backend and reader
+    # calls it caused, and whether the run's state moved.
     _, who, options, proposal, change = case
     backend, shown = Submissions(), []
     def reader(ctx):
@@ -514,15 +545,17 @@ def attempt(req, case):
     before = backend.calls, len(shown)
     if change:
         change(run)
+    state = run.state
     h = Harness(who, backend, reader, **options)
     out = dispatch(h, run, deepcopy(proposal))
     return (out.get("error", "accepted"),
             backend.calls - before[0],
-            len(shown) - before[1])
+            len(shown) - before[1], run.state != state)
 
 def exit_test(req):
     rows = [(c[0], *attempt(req, c)) for c in HOSTILE]
-    assert all(b == r == 0 for _, _, b, r in rows), rows
+    assert all(b == r == 0 and not moved
+               for _, _, b, r, moved in rows), rows
     assert attempt(req, CONTROL)[1] == 1   # the gate is
     return rows                             # not just shut
 # end listing
@@ -539,9 +572,13 @@ def live_planner5(harness, full=True):
     """The notebook's live planner for Chapter 5; its tool text comes from the specs."""
     from .ch01 import chat, parse_json
 
+    skill = harness.skill
+    guide = (f"\nSkill {skill.name}:\n{skill.body}\n"
+             if skill is not None and skill.body else "")
+
     def planner(context):
         tools = [harness.tools[n] for n in context["tools"]]
-        prompt = (PLANNER5 + describe(tools, full) + "\nRun so far:\n"
+        prompt = (PLANNER5 + describe(tools, full) + guide + "\nRun so far:\n"
                   + json.dumps(context, default=str))
         try:
             return parse_json(chat(prompt))

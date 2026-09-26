@@ -37,6 +37,10 @@ class UnknownTool(Exception):
     """A protocol error in MCP, not a tool result: the spec's code -32602."""
 
 
+class InvalidParams(Exception):
+    """A tools/call whose arguments are not an object: code -32602."""
+
+
 class Server:
     def __init__(self, harness, run):
         self.harness, self.run = harness, run
@@ -55,7 +59,10 @@ class Server:
             if name not in self.harness.visible(self.run):   # finish is not a tool
                 raise UnknownTool(f"unknown tool {ch05.preview(name)}; "
                                   f"tools: {self.harness.visible(self.run)}")
-            proposal = {"tool": name, "args": params.get("arguments", {})}
+            args = params.get("arguments", {})
+            if not isinstance(args, dict):
+                raise InvalidParams("arguments must be an object")
+            proposal = {"tool": name, "args": args}
             try:
                 out = self.harness.dispatch(self.run, proposal)
             except Exception as why:            # a tool failed: report it, keep serving
@@ -80,9 +87,14 @@ class Server:
                 continue
             if not isinstance(msg, dict) or "id" not in msg:   # notifications need no reply
                 continue
+            if (msg.get("jsonrpc") != "2.0" or type(msg.get("method")) is not str
+                    or not isinstance(msg.get("params", {}), dict)):
+                write(json.dumps({"jsonrpc": "2.0", "id": msg["id"],
+                                  "error": {"code": -32600, "message": "invalid request"}}) + "\n")
+                continue
             try:
                 reply = {"jsonrpc": "2.0", "id": msg["id"], "result": self.handle(msg)}
-            except UnknownTool as why:
+            except (UnknownTool, InvalidParams) as why:
                 reply = {"jsonrpc": "2.0", "id": msg["id"],
                          "error": {"code": -32602, "message": str(why)}}
             except KeyError as why:
