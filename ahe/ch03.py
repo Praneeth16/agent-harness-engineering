@@ -6,7 +6,11 @@ from .ch02 import (D, NOTES, RECORDS, ContractError, Evidence,
                    judge_note_rule, read_note, request, validate)
 
 # listing 3.1
+from copy import deepcopy
 from dataclasses import dataclass, field
+from itertools import count
+
+RUN_IDS = count(1)
 
 class BudgetExhausted(Exception):
     pass
@@ -25,6 +29,7 @@ class Run:
     evidence: list = field(default_factory=list)
     problems: dict = field(default_factory=dict)
     results: dict = field(default_factory=dict)
+    version: int = 0          # bumped when evidence changes
     computed: dict = field(default_factory=dict) # rule
     changed: dict = field(default_factory=dict)  # field
     hits: set = field(default_factory=set)   # search hits
@@ -44,8 +49,9 @@ class Run:
         return sum(e["kind"] == kind for e in self.events)
 
 def start(req, budget=None):
+    req = deepcopy(req)           # the run owns its copy
     protocol = validate(req)      # raises ContractError
-    run = Run(f"run-{req['patient']}-{req['on']}", req,
+    run = Run(f"run-{next(RUN_IDS)}-{req['patient']}", req,
               protocol, budget or Budget())
     run.evidence = list(RECORDS[req["patient"]])
     run.record("request", patient=req["patient"],
@@ -64,7 +70,8 @@ def t_search(run, terms):
     hits = [n.id for n in notes_of(run)
             if any(w in n.text.lower() for w in low)]
     if set(hits) - run.hits:
-        run.changed["anticoagulant"] = len(run.events)
+        run.version += 1
+        run.changed["anticoagulant"] = run.version
     run.hits.update(hits)
     return {"notes": hits}
 def t_read(run, note_id, reader):
@@ -75,7 +82,8 @@ def t_read(run, note_id, reader):
     note = next(n for n in notes_of(run) if n.id == note_id)
     item, problem = read_note(reader, note, "anticoagulant",
                               run.request["on"])
-    run.changed["anticoagulant"] = len(run.events)
+    run.version += 1
+    run.changed["anticoagulant"] = run.version
     if item is None:
         if problem != "no statement in note":
             run.problems[note_id] = problem
@@ -97,7 +105,7 @@ def t_evaluate(run, rule_id):
     else:
         result = evaluate(rule, run.evidence, on)
     run.results[rule_id] = result
-    run.computed[rule_id] = len(run.events)
+    run.computed[rule_id] = run.version
     return {"rule": rule_id, "status": result.status,
             "reason": result.reason}
 # end listing
@@ -122,7 +130,7 @@ def gate(run, proposal):
         return "proposal is not an object"
     tool = proposal.get("tool")
     args = proposal.get("args", {})
-    if tool not in SPEC:
+    if type(tool) is not str or tool not in SPEC:
         return f"tool not allowed: {tool}"
     names = set(SPEC[tool])
     if not isinstance(args, dict) or set(args) != names:
@@ -153,11 +161,11 @@ def unfinished(run):
     # evidence for its field changed after it was computed.
     return [r.id for r in run.protocol.rules
             if r.id not in run.results
-            or run.changed.get(r.field, -1)
+            or run.changed.get(r.field, 0)
             > run.computed[r.id]]
 
 def step(run, planner, reader, context=context_for):
-    ctx = context(run)
+    ctx = deepcopy(context(run))   # the planner gets a copy
     have = 2 if "pending" in ctx else 1  # v2: Chapter 4
     want = getattr(planner, "context_schema", have)
     if want != have:
@@ -183,6 +191,8 @@ def step(run, planner, reader, context=context_for):
             return
         run.state = "completed"
         run.reason = "every rule has a current result"
+        run.record("observation", tool="finish",
+                   accepted=True)
         return
     if tool == "read_note":
         args = {**args, "reader": reader}
@@ -193,6 +203,8 @@ def step(run, planner, reader, context=context_for):
 # listing 3.5
 def drive(run, planner, reader=fake_reader,
           context=context_for):
+    if run.state != "running":
+        raise ContractError(f"{run.id} already {run.state}")
     while run.state == "running":
         if run.cancel:
             run.state = "cancelled"
@@ -208,6 +220,7 @@ def drive(run, planner, reader=fake_reader,
             except Exception as why:      # a tool failed
                 run.state = "failed"
                 run.reason = f"{type(why).__name__}: {why}"
+                run.record("observation", error=run.reason)
     run.record("stop", state=run.state, reason=run.reason)
     return run
 
@@ -242,6 +255,8 @@ def fixed_screen(req, reader=fake_reader):
     for note_id in t_search(run, SEARCH_TERMS)["notes"]:
         t_read(run, note_id, reader)
     t_evaluate(run, "no_anticoag")
+    run.state, run.reason = "completed", "procedure ran"
+    run.record("stop", state=run.state, reason=run.reason)
     return run
 # end listing
 

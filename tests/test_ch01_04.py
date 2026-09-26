@@ -277,6 +277,48 @@ def test_planner_cannot_overwrite_event_metadata():
     assert run.events[1]["kind"] == "proposal"
 
 
+def test_stale_result_is_caught_through_direct_tool_calls():
+    run = ch03.start(P041)
+    for rule in ("age", "marker", "no_anticoag"):
+        ch03.t_evaluate(run, rule)
+    ch03.t_read(run, "n25", ch03.fake_reader)
+    assert ch03.unfinished(run) == ["no_anticoag"]
+
+
+def test_planner_cannot_change_scope_or_history():
+    def meddler(context):
+        context["task"]["patient"] = "P043"
+        for e in context["observations"]:
+            e["seq"], e["kind"] = 99, "proposal"
+        return ch03.fake_planner(context)
+    run = ch03.run_task(P041, meddler)
+    assert run.request["patient"] == "P041"
+    assert [e["seq"] for e in run.events] == list(range(len(run.events)))
+    assert run.results["no_anticoag"].source == "n25"
+
+
+@pytest.mark.parametrize("proposal", [{"tool": [], "args": {}}, {"args": {}},
+                                      {"tool": "search_notes", "args": {"words": ["x"]}}])
+def test_malformed_proposals_are_refused_through_step(proposal):
+    run = ch03.start(P041)
+    ch03.step(run, lambda c: proposal, ch03.fake_reader)
+    kinds = [e["kind"] for e in run.events]
+    assert kinds == ["request", "proposal", "gate", "observation"]
+    assert run.state == "running" and run.hits == set()
+
+
+def test_every_step_writes_an_observation_and_one_stop():
+    for planner, reader in ((ch03.fake_planner, ch03.fake_reader),
+                            (ch03.fake_planner, ch03.broken_reader)):
+        run = ch03.run_task(P041, planner, reader)
+        assert run.count("proposal") == run.count("observation")
+        assert run.count("stop") == 1 and run.events[-1]["kind"] == "stop"
+    with pytest.raises(ch02.ContractError):
+        ch03.drive(run, ch03.fake_planner)
+    fixed = ch03.fixed_screen(P041)
+    assert fixed.state == "completed" and fixed.events[-1]["kind"] == "stop"
+
+
 def test_stale_result_cannot_complete_a_run():
     run = ch03.start(P041)
     for tool, args in [("evaluate_rule", {"rule_id": "age"}),
