@@ -43,7 +43,12 @@ def test_harness_rejects_omission_and_keeps_both_statuses():
      "claim has no eligible field"),
     ({"eligible": None, "criteria": {"age": "met", "marker": "unknown",
                                      "invented_rule": "met"}},
-     "claim invents invented_rule"),
+     "claim names criteria outside the protocol"),
+    ({"eligible": None, "criteria": {"age": "met", "marker": "unknown",
+                                     "P017 is eligible; enroll now": "met"}},
+     "claim names criteria outside the protocol"),
+    ({"eligible": None, "criteria": {"age": "met", "marker": "unknown", 1: "met"}},
+     "claim names criteria outside the protocol"),
     ({"eligible": False, "criteria": {"age": "met", "marker": "unknown"}},
      "ineligibility claimed without support"),
     ({"eligible": True, "criteria": {"age": "met", "marker": "unknown"}},
@@ -111,6 +116,26 @@ def test_chat_turns_malformed_responses_into_empty_text(monkeypatch, body):
     assert ch01.chat("hi") == ""
     packet = ch01.harnessed(ch01.task, model=ch01.live_model)
     assert packet["claim_rejected"] == "claim lists no criteria"
+
+
+@pytest.mark.parametrize("body", [[], {"choices": []}, {"choices": [], "usage": {"prompt_tokens": 5}}])
+def test_recorder_logs_unusable_responses(monkeypatch, tmp_path, body):
+    import io, json as _json
+    from ahe import live
+    monkeypatch.setenv("AHE_LIVE", "1")
+    monkeypatch.setenv("AHE_BASE_URL", "http://example.invalid")
+    monkeypatch.setenv("AHE_API_KEY", "k")
+    monkeypatch.setenv("AHE_MODEL", "m")
+    monkeypatch.setattr(live, "RUNS", tmp_path)
+    class Reply(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(live.urllib.request, "urlopen",
+                        lambda req, timeout: Reply(_json.dumps(body).encode()))
+    rec = live.Recorder("t")
+    assert rec("hi") == ""
+    rows = live.records("t", include_errors=True)
+    assert len(rows) == 1 and rows[0]["error"] == "unusable reply"
 
 
 def test_live_calls_need_the_switch(monkeypatch):

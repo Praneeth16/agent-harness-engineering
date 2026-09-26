@@ -37,6 +37,7 @@ class Recorder:
         self.effort = effort
         self.path = RUNS / f"{experiment}.jsonl"
         self.path.parent.mkdir(exist_ok=True)
+        self.trial = None        # set by the experiment driver; links calls to outcomes
 
     def __call__(self, prompt):
         env = os.environ
@@ -57,26 +58,31 @@ class Recorder:
             with urllib.request.urlopen(req, timeout=180) as reply:
                 out = json.load(reply)
         except Exception as why:          # failed calls are records too
-            self._write({"experiment": self.experiment, "at": _now(),
+            self._write({"experiment": self.experiment, "at": _now(), "trial": self.trial,
                          "endpoint": url, "requested_model": body["model"],
                          "prompt": prompt, "error": f"{type(why).__name__}: {why}",
                          "seconds": round(time.time() - started, 2)})
             raise
-        usage = out.get("usage") or {}
+        usage = out.get("usage") if isinstance(out, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
         try:
             content = out["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
             content = None
         if not isinstance(content, str):   # unusable: keep the raw reply
             self._write({"experiment": self.experiment, "at": _now(),
-                         "endpoint": url, "requested_model": body["model"],
-                         "prompt": prompt, "error": "unusable reply",
-                         "raw": out, "cost_usd": usage.get("cost"),
+                         "trial": self.trial, "endpoint": url,
+                         "requested_model": body["model"], "prompt": prompt,
+                         "error": "unusable reply", "raw": out,
+                         "prompt_tokens": usage.get("prompt_tokens"),
+                         "completion_tokens": usage.get("completion_tokens"),
+                         "cost_usd": usage.get("cost"),
                          "seconds": round(time.time() - started, 2)})
             return ""
         self._write({
                 "experiment": self.experiment,
                 "at": _now(),
+                "trial": self.trial,
                 "endpoint": url,
                 "code_version": _code_version(),
                 "requested_model": body["model"],
@@ -95,7 +101,8 @@ class Recorder:
 
     def outcome(self, **fields):
         """Record how a trial ended, so a replay can be checked against it."""
-        self._write({"experiment": self.experiment, "at": _now(), "outcome": fields})
+        self._write({"experiment": self.experiment, "at": _now(), "trial": self.trial,
+                     "outcome": fields})
 
     def _write(self, record):
         with self.path.open("a") as f:
