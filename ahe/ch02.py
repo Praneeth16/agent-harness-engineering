@@ -58,10 +58,13 @@ PROTOCOLS = [
 ASSIGNED = {"reviewer-a": {"T004"}, "reviewer-b": {"T009"}}
 VOCABULARY = {"age", "marker", "anticoagulant"}
 TERMS = {"anticoagulant": (   # words that make a note count
-    "warfarin", "apixaban", "eliquis", "doac",
-    "anticoagulant")}
-COVERS = {"past year": 365, "past 12 months": 365,
-          "past six months": 182}  # how far back "no" looks
+    "anticoagulant", "doac", "warfarin", "coumadin",
+    "apixaban", "eliquis", "rivaroxaban", "xarelto",
+    "dabigatran", "pradaxa", "edoxaban", "heparin",
+    "enoxaparin", "lovenox")}
+PERIODS = {"past year": 365, "past 12 months": 365,
+           "past six months": 182}  # how far "no" looks
+MAX_GAP_DAYS = 7   # an absence reviewed this close counts
 
 class ContractError(Exception):
     pass
@@ -102,6 +105,15 @@ def evaluate(rule, evidence, on):
              if e.field == rule.field and e.observed <= on]
     if not items:
         return Result("unknown", f"no value by {on}")
+    limit = rule.max_age_days
+    if limit is not None:   # old readings are not evidence
+        fresh = [e for e in items
+                 if (on - e.observed).days <= limit]
+        if not fresh:
+            e = max(items, key=lambda e: e.observed)
+            return Result("unknown", f"stale: {e.observed}",
+                          e.id)
+        items = fresh
     bad = [e for e in items if not finite(e.value)]
     if bad:
         return Result("unknown", "value is not a number",
@@ -110,15 +122,6 @@ def evaluate(rule, evidence, on):
     if odd:
         return Result("unknown", f"unit is {odd[0].unit}",
                       odd[0].id)
-    limit = rule.max_age_days
-    if limit is not None:
-        fresh = [e for e in items
-                 if (on - e.observed).days <= limit]
-        if not fresh:
-            e = max(items, key=lambda e: e.observed)
-            return Result("unknown", f"stale: {e.observed}",
-                          e.id)
-        items = fresh
     e = max(items, key=lambda e: e.observed)
     inside = rule.lower <= e.value <= rule.upper
     why = f"{e.value} {e.unit} on {e.observed}"
@@ -173,9 +176,10 @@ def ground(p, note, field, on):
     if len(said) > 1:
         return "several statements; needs review"
     quote = p.get("quote")
+    whole = sentences(note.text)
     if type(quote) is not str or (
-            quote.strip().rstrip(".") not in said):
-        return "quotation is not the note's statement"
+            quote.strip().rstrip(".") not in whole):
+        return "quotation is not a sentence of the note"
     if status == "unclear":
         return "statement unclear; needs review"
     no = quote.strip().lower().startswith(NEGATIONS)
@@ -200,20 +204,33 @@ def ground(p, note, field, on):
 def read_note(model, note, field, on):
     proposal = model({"note": note.text, "field": field})
     problem = ground(proposal, note, field, on)
-    if problem:
-        return None, problem
+    if problem:                 # keep a quote that is real
+        q = proposal.get("quote") if isinstance(
+            proposal, dict) else None
+        q = q.strip().rstrip(".") if type(q) is str else ""
+        real = q in sentences(note.text)
+        return None, problem, q if real else None
     present = proposal["status"] == "present"
     when = date.fromisoformat(proposal["observed"])
     quote = proposal["quote"].strip().rstrip(".")
     return Evidence(note.id, field, 1.0 if present else 0.0,
-                    "statement", when, quote), None
+                    "statement", when, quote), None, quote
 
-def covers(quote):
-    low = quote.lower()
-    return max([d for k, d in COVERS.items() if k in low],
-               default=0)
+ABSENCE = re.compile(
+    r"no (\w+)( therapy| treatment)? (in|over) the "
+    r"(past year|past 12 months|past six months)"
+    r"(, reviewed \d{4}-\d{2}-\d{2})?")
 
-def judge_note_rule(rule, found, problems, on):
+def covers(quote, field):
+    # Days an absence statement looks back, or 0 if it is
+    # not in the one form the harness accepts.
+    m = ABSENCE.fullmatch(quote.lower())
+    if not m or m.group(1) not in TERMS[field]:
+        return 0
+    return PERIODS[m.group(4)]
+
+def judge_note_rule(rule, found, problems, on,
+                    quotes=None):
     recent = [f for f in found if f.field == rule.field
               and 0 <= (on - f.observed).days
               <= rule.window_days]
@@ -224,32 +241,38 @@ def judge_note_rule(rule, found, problems, on):
                       f.id, f.quote)
     if problems:                # one unread note is enough
         nid, why = next(iter(problems.items()))
-        return Result("unknown", f"{nid}: {why}", nid)
-    ok = [f for f in recent
-          if covers(f.quote) >= rule.window_days]
+        return Result("unknown", f"{nid}: {why}", nid,
+                      (quotes or {}).get(nid))
+    w = rule.window_days
+    ok = [f for f in recent        # covers the whole window
+          if (on - f.observed).days <= MAX_GAP_DAYS
+          and covers(f.quote, rule.field)
+          >= w - (on - f.observed).days]
     if ok:
         f = ok[-1]
         return Result("met", f"absence stated {f.observed}",
                       f.id, f.quote)
     if recent:
-        days = rule.window_days
-        why = f"absence does not cover {days} days"
-        return Result("unknown", why, recent[-1].id)
+        f = recent[-1]
+        why = f"absence does not cover the {w} days"
+        return Result("unknown", why, f.id, f.quote)
     return Result("unknown", "no grounded statement")
 
 def evaluate_note_rule(rule, notes, on, model):
-    found, problems = [], {}
+    found, problems, quotes = [], {}, {}
     for note in notes:
         if note.written > on:       # not yet written
             continue
-        item, problem = read_note(model, note, rule.field,
-                                  on)
+        item, problem, quote = read_note(
+            model, note, rule.field, on)
+        quotes[note.id] = quote
         if item is None:
             if problem != "no statement in note":
                 problems[note.id] = problem
         else:
             found.append(item)
-    return judge_note_rule(rule, found, problems, on)
+    return judge_note_rule(rule, found, problems, on,
+                           quotes)
 # end listing
 
 
@@ -303,6 +326,17 @@ RECORDS = {
              Evidence("e36", "marker", 5, "ng/mL", D(2026, 8, 25))],
     "P048": [Evidence("e37", "age", 53, "years", D(2026, 9, 1)),
              Evidence("e38", "marker", float("nan"), "ng/mL", D(2026, 8, 25))],
+    "P049": [Evidence("e39", "age", 44, "years", D(2026, 9, 1)),
+             Evidence("e40", "marker", 5, "ng/mL", D(2026, 8, 25))],
+    "P050": [Evidence("e41", "age", 45, "years", D(2026, 9, 1)),
+             Evidence("e42", "marker", 5, "ng/mL", D(2026, 8, 25))],
+    "P051": [Evidence("e43", "age", 46, "years", D(2026, 9, 1)),
+             Evidence("e44", "marker", 5, "ng/mL", D(2026, 8, 25))],
+    "P052": [Evidence("e45", "age", 47, "years", D(2026, 9, 1)),
+             Evidence("e46", "marker", 5, "ng/mL", D(2026, 8, 25))],
+    "P053": [Evidence("e47", "age", 48, "years", D(2026, 9, 1)),
+             Evidence("e48", "marker", float("nan"), "ng/mL", D(2025, 1, 1)),
+             Evidence("e49", "marker", 5, "ng/mL", D(2026, 8, 25))],
 }
 NOTES = {
     "P036": [Note("n01", D(2026, 7, 2),
@@ -327,6 +361,21 @@ NOTES = {
     "P047": [Note("n07", D(2026, 8, 30),
                   "No anticoagulant therapy on 2026-08-30. Continues "
                   "metformin.")],
+    "P049": [Note("n08", D(2026, 8, 30),      # continuation, not absence
+                  "No interruption of warfarin therapy in the past year, "
+                  "reviewed 2026-08-30.")],
+    "P050": [Note("n09", D(2026, 8, 31),      # absence, then a start
+                  "No anticoagulant therapy in the past year, reviewed "
+                  "2026-08-30; started warfarin on 2026-08-31.")],
+    "P051": [Note("n10", D(2026, 3, 10),      # true then, not now
+                  "No anticoagulant therapy in the past year, reviewed "
+                  "2026-03-10.")],
+    "P052": [Note("n11", D(2026, 8, 30),
+                  "No anticoagulant therapy in the past year, reviewed "
+                  "2026-08-30."),
+             Note("n12", D(2026, 8, 31),
+                  "Pulmonary embolism. Started rivaroxaban 20 mg daily "
+                  "on 2026-08-31.")],
 }
 
 
@@ -361,6 +410,10 @@ def hider(context):
     return {"field": context["field"], "status": "none",
             "observed": None, "quote": ""}
 
+def doubter(context):
+    # Reads the note faithfully and calls it unclear.
+    return {**fake_reader(context), "status": "unclear"}
+
 def garbler(context):
     # Well-formed JSON with the wrong types in it.
     return {"field": context["field"], "status": "present",
@@ -394,8 +447,10 @@ def prepare(req, model=fake_reader):
             results[rule.id] = evaluate(rule, evidence,
                                         req["on"])
     name = f"{protocol.study} v{protocol.version}"
-    return {"status": "prepared", "protocol": name,
-            "criteria": results, "review": "pending"}
+    return {"schema": "packet/2", "status": "prepared",
+            "patient": req["patient"], "on": req["on"],
+            "protocol": name, "criteria": results,
+            "review": "pending"}
 
 def check(fx, got, calls):
     # Every expectation is written before the code runs.
@@ -404,14 +459,17 @@ def check(fx, got, calls):
     if calls != fx["calls"]:
         bad.append(f"calls {calls} != {fx['calls']}")
     want = fx.get("criteria", {})
-    if got["status"] == "prepared" and set(want) != set(
-            got["criteria"]):
-        bad.append(f"rules {sorted(got['criteria'])}")
-    for rule, (status, why, src) in want.items():
-        r = got["criteria"][rule]
-        if (r.status, r.source) != (status, src) or (
-                why not in r.reason):
+    have = got.get("criteria", {})
+    prepared = got["status"] == "prepared"
+    if prepared and set(want) != set(have):
+        bad.append(f"rules {sorted(have)}")
+    for rule, (status, why, src, *quote) in want.items():
+        r = have.get(rule)
+        if r is None or (r.status, r.source) != (
+                status, src) or why not in r.reason:
             bad.append(f"{rule}: {r}")
+        elif quote and r.quote != quote[0]:
+            bad.append(f"{rule} quote: {r.quote!r}")
     return bad
 
 def run_fixtures(fixtures, prepare=prepare):
@@ -443,8 +501,8 @@ def crit(**rules):
     # rule id -> (status, words the reason must contain, source)
     return rules
 
-AGE_MET = lambda src: ("met", "", src)
-MET = lambda src, why="": ("met", why, src)
+AGE_MET = lambda src: ("met", "years", src)
+MET = lambda src, why="ng/mL": ("met", why, src)
 NO_NOTES = ("unknown", "no grounded statement", None)
 
 FIXTURES = [
@@ -485,23 +543,28 @@ FIXTURES = [
     {"id": "F11", "shape": "note states anticoagulant started in window", "calls": 1,
      "request": request("P036", 3), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e15"), marker=MET("e16"),
-                      no_anticoag=("not met", "present 2026-07-02", "n01"))},
+                      no_anticoag=("not met", "present 2026-07-02", "n01",
+                                   "Started warfarin 5 mg daily on 2026-07-02"))},
     {"id": "F12", "shape": "note states absence over the past year", "calls": 1,
      "request": request("P037", 3), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e17"), marker=MET("e18"),
-                      no_anticoag=("met", "absence stated 2026-08-30", "n02"))},
+                      no_anticoag=("met", "absence stated 2026-08-30", "n02",
+                                   "No anticoagulant therapy in the past year, "
+                                   "reviewed 2026-08-30"))},
     {"id": "F13", "shape": "note mentions the drug but no date", "calls": 1,
      "request": request("P038", 3), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e19"), marker=MET("e20"),
-                      no_anticoag=("unknown", "no date", "n03"))},
+                      no_anticoag=("unknown", "no date", "n03",
+                                   "Discussed starting apixaban at the next visit "
+                                   "pending cardiology review"))},
     {"id": "F14", "shape": "reader invents a quotation", "calls": 1, "model": liar,
      "request": request("P036", 3), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e15"), marker=MET("e16"),
-                      no_anticoag=("unknown", "not the note's statement", "n01"))},
+                      no_anticoag=("unknown", "not a sentence of the note", "n01"))},
     {"id": "F15", "shape": "reader forges absence with an empty quotation", "calls": 1,
      "model": forger, "request": request("P036", 3), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e15"), marker=MET("e16"),
-                      no_anticoag=("unknown", "not the note's statement", "n01"))},
+                      no_anticoag=("unknown", "not a sentence of the note", "n01"))},
     {"id": "F16", "shape": "reader answers a different field", "calls": 1, "model": drifter,
      "request": request("P036", 3), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e15"), marker=MET("e16"),
@@ -521,7 +584,7 @@ FIXTURES = [
     {"id": "F20", "shape": "reader quotes only the date", "calls": 1, "model": fragment,
      "request": request("P036", 3), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e15"), marker=MET("e16"),
-                      no_anticoag=("unknown", "not the note's statement", "n01"))},
+                      no_anticoag=("unknown", "not a sentence of the note", "n01"))},
     {"id": "F21", "shape": "reader says a relevant note is silent", "calls": 1,
      "model": hider, "request": request("P036", 3), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e15"), marker=MET("e16"),
@@ -536,14 +599,38 @@ FIXTURES = [
     {"id": "F24", "shape": "absence stated for one day only", "calls": 1,
      "request": request("P047", 3), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e35"), marker=MET("e36"),
-                      no_anticoag=("unknown", "does not cover 180 days", "n07"))},
+                      no_anticoag=("unknown", "does not cover the 180 days", "n07"))},
     {"id": "F25", "shape": "marker value is not a number", "calls": 0,
      "request": request("P048", 2), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e37"), marker=("unknown", "not a number", "e38"))},
     {"id": "F26", "shape": "reader returns the wrong types", "calls": 1, "model": garbler,
      "request": request("P036", 3), "expect": PREPARED,
      "criteria": crit(age=AGE_MET("e15"), marker=MET("e16"),
-                      no_anticoag=("unknown", "not the note's statement", "n01"))},
+                      no_anticoag=("unknown", "not a sentence of the note", "n01"))},
+    {"id": "F27", "shape": "continuation of therapy phrased with \"no\"", "calls": 1,
+     "request": request("P049", 3), "expect": PREPARED,
+     "criteria": crit(age=AGE_MET("e39"), marker=MET("e40"),
+                      no_anticoag=("unknown", "does not cover the 180 days", "n08"))},
+    {"id": "F28", "shape": "absence and a start in one sentence", "calls": 1,
+     "request": request("P050", 3), "expect": PREPARED,
+     "criteria": crit(age=AGE_MET("e41"), marker=MET("e42"),
+                      no_anticoag=("unknown", "does not cover the 180 days", "n09"))},
+    {"id": "F29", "shape": "absence stated in March, request in September", "calls": 1,
+     "request": request("P051", 3), "expect": PREPARED,
+     "criteria": crit(age=AGE_MET("e43"), marker=MET("e44"),
+                      no_anticoag=("unknown", "does not cover the 180 days", "n10"))},
+    {"id": "F30", "shape": "absence in one note, rivaroxaban in the next", "calls": 2,
+     "request": request("P052", 3), "expect": PREPARED,
+     "criteria": crit(age=AGE_MET("e45"), marker=MET("e46"),
+                      no_anticoag=("not met", "present 2026-08-31", "n12"))},
+    {"id": "F31", "shape": "reader calls a real sentence unclear", "calls": 1,
+     "model": doubter, "request": request("P036", 3), "expect": PREPARED,
+     "criteria": crit(age=AGE_MET("e15"), marker=MET("e16"),
+                      no_anticoag=("unknown", "unclear", "n01",
+                                   "Started warfarin 5 mg daily on 2026-07-02"))},
+    {"id": "F32", "shape": "old corrupt reading beside a fresh valid one", "calls": 0,
+     "request": request("P053", 3), "expect": PREPARED,
+     "criteria": crit(age=AGE_MET("e47"), marker=MET("e49"), no_anticoag=NO_NOTES)},
 ]
 
 if __name__ == "__main__":

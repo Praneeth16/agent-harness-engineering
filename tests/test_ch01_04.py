@@ -204,8 +204,10 @@ def test_existence_is_not_revealed_to_unassigned_reviewer():
 
 def test_unresolved_note_blocks_a_clean_met():
     rule = ch02.PROTOCOLS[1].rules[2]
-    absent = ch02.Evidence("n9", "anticoagulant", 0.0, "statement",
-                           D(2026, 8, 1), "No anticoagulant therapy")
+    absent = ch02.Evidence("n9", "anticoagulant", 0.0, "statement", D(2026, 8, 30),
+                           "No anticoagulant therapy in the past year, reviewed 2026-08-30")
+    alone = ch02.judge_note_rule(rule, [absent], {}, D(2026, 9, 1))
+    assert alone.status == "met"          # the absence qualifies on its own
     r = ch02.judge_note_rule(rule, [absent], {"n8": "statement has no date"},
                              D(2026, 9, 1))
     assert r.status == "unknown"
@@ -215,7 +217,7 @@ def test_unresolved_note_blocks_a_clean_met():
     ({"field": "anticoagulant", "status": "maybe", "quote": "x",
       "observed": "2026-07-02"}, "unknown status"),
     ({"field": "anticoagulant", "status": "present", "quote": "  ",
-      "observed": "2026-07-02"}, "not the note's statement"),
+      "observed": "2026-07-02"}, "not a sentence of the note"),
     ({"field": "anticoagulant", "status": ["present"], "quote": "x",
       "observed": "2026-07-02"}, "unknown status"),
     ("not an object", "reply is not an object"),
@@ -241,6 +243,16 @@ def test_manifest_rejects_unknown_fields_and_repeated_ids():
             ch02.check_manifest([p])
 
 
+def test_check_catches_a_corrupted_quote_and_a_missing_rule():
+    fx = next(f for f in ch02.FIXTURES if f["id"] == "F12")
+    got = ch02.prepare(fx["request"])
+    forged = {**got, "criteria": {**got["criteria"], "no_anticoag":
+              got["criteria"]["no_anticoag"]._replace(quote="NOT FROM NOTE")}}
+    assert ch02.check(fx, forged, 1)
+    missing = {**got, "criteria": {k: v for k, v in got["criteria"].items() if k != "age"}}
+    assert ch02.check(fx, missing, 1)
+
+
 def test_check_catches_a_corrupted_source():
     fx = next(f for f in ch02.FIXTURES if f["id"] == "F11")
     got = ch02.prepare(fx["request"])
@@ -256,9 +268,9 @@ def test_chapter_2_packet_carries_chapter_1_statuses():
 
 def test_fixtures_do_not_change_the_data():
     import copy
-    before = copy.deepcopy((ch02.RECORDS, ch02.NOTES))
+    before = repr((ch02.RECORDS, ch02.NOTES))
     ch02.run_fixtures(ch02.FIXTURES)
-    assert (ch02.RECORDS.keys(), ch02.NOTES.keys()) == (before[0].keys(), before[1].keys())
+    assert repr((ch02.RECORDS, ch02.NOTES)) == before
 
 
 # ---------------------------------------------------------------- Chapter 3
@@ -445,8 +457,8 @@ def test_inspect_log_is_bounded():
 
 def test_exercise_4_3_note_is_invisible_to_lexical_search():
     # The reader can read the note when handed it, so a miss is retrieval's.
-    item, problem = ch02.read_note(ch02.fake_reader, ch02.NOTES["P044"][0], "anticoagulant",
-                                   D(2026, 9, 1))
+    item, problem, _ = ch02.read_note(ch02.fake_reader, ch02.NOTES["P044"][0],
+                                      "anticoagulant", D(2026, 9, 1))
     assert problem is None and item.value == 1.0
     run = ch03.run_task(request("P044", 3), ch04.planner_v2, context=ch04.context_v2)
     assert run.hits == set()

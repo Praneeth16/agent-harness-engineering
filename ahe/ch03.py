@@ -80,8 +80,9 @@ def t_read(run, note_id, reader):
     run.reads += 1
     run.seen.add(note_id)
     note = next(n for n in notes_of(run) if n.id == note_id)
-    item, problem = read_note(reader, note, "anticoagulant",
-                              run.request["on"])
+    item, problem, _ = read_note(reader, note,
+                                 "anticoagulant",
+                                 run.request["on"])
     run.version += 1
     run.changed["anticoagulant"] = run.version
     if item is None:
@@ -235,7 +236,10 @@ def run_task(req, planner, reader=fake_reader, budget=None,
 def packet(run):
     # Chapter 2's packet, from a run in any end state.
     p = run.protocol
-    return {"status": run.state, "reason": run.reason,
+    return {"schema": "packet/3", "status": run.state,
+            "reason": run.reason,
+            "patient": run.request["patient"],
+            "on": run.request["on"],
             "protocol": f"{p.study} v{p.version}",
             "criteria": dict(run.results),
             "unfinished": unfinished(run),

@@ -122,7 +122,7 @@ print(harnessed(task, model=overclaims)["claim_rejected"])'''),
 
 CH2 = notebook(
     "Chapter 2: Turn domain work into executable contracts",
-    "Companion to *Agent Harness Engineering*. Listings 2.1 to 2.6 live in `ahe/ch02.py`.",
+    "Companion to *Agent Harness Engineering*. Listings 2.1 to 2.7 live in `ahe/ch02.py`.",
     [
         md("## 1. The fixtures (Table 2.5)"),
         code('''from ahe import ch02
@@ -171,12 +171,14 @@ else:
     print(v, prepare(request("P023", v))["criteria"]["marker"])'''),
         md("### Exercise 2.2\n\nThe coordinator would not pick one: two fresh readings that disagree on the status are `unknown`, and the reason names both. Write the fixture first, then change `evaluate`."),
         code('''from datetime import date
-from ahe.ch02 import Evidence, Result, evaluate, PROTOCOLS
+from ahe.ch02 import Evidence, Result, evaluate, finite, PROTOCOLS
 
 def evaluate_2_2(rule, evidence, on):
     result = evaluate(rule, evidence, on)
+    if result.status == "unknown":
+        return result          # missing, stale, not a number, or wrong unit
     fresh = [e for e in evidence if e.field == rule.field and e.unit == rule.unit
-             and e.observed <= on and (rule.max_age_days is None
+             and finite(e.value) and e.observed <= on and (rule.max_age_days is None
                                        or (on - e.observed).days <= rule.max_age_days)]
     statuses = {rule.lower <= e.value <= rule.upper for e in fresh}
     if len(statuses) > 1:
@@ -188,12 +190,14 @@ marker = PROTOCOLS[1].rules[1]
 readings = [Evidence("x1", "marker", 5, "ng/mL", date(2026, 8, 20)),
             Evidence("x2", "marker", 9, "ng/mL", date(2026, 8, 25))]
 print(evaluate(marker, readings, date(2026, 9, 1)))
-print(evaluate_2_2(marker, readings, date(2026, 9, 1)))'''),
+print(evaluate_2_2(marker, readings, date(2026, 9, 1)))
+broken = [Evidence("x3", "marker", None, "ng/mL", date(2026, 8, 20)), readings[0]]
+print(evaluate_2_2(marker, broken, date(2026, 9, 1)))   # unknown: not a number'''),
         md("### Exercise 2.3\n\nThe stand-in reader sees `warfarin` and a date and reports `present`; the quotation and date are both in the note, so `ground` accepts it and the rule comes out `not met`. The packet's quotation is what lets the reviewer catch the error. Measuring how often it happens needs notes labeled by a person, which Chapter 9 builds."),
         code('''from ahe.ch02 import Note, read_note
 tricky = Note("n99", date(2026, 8, 1),
               "Warfarin was considered on 2026-08-01 and rejected because of bleeding risk.")
-print(read_note(ch02.fake_reader, tricky, "anticoagulant", date(2026, 9, 1)))'''),
+print(read_note(ch02.fake_reader, tricky, "anticoagulant", date(2026, 9, 1))[:2])'''),
     ])
 
 
@@ -332,7 +336,7 @@ print(all(no_ungrounded_text(run, e["bundle"]) for e in run.events if e["kind"] 
         md("### Exercise 4.3\n\nHanded the note, the stand-in reader grounds it as `present`, so the reader is not the problem. Lexical search with the listed terms never returns it, and the rule stays `unknown`. A fixture that justifies vector search states that n70 is relevant, that a search for anticoagulants must return it, and that `ground` must still find the quotation and date in the note, because a similarity match is not a reading."),
         code('''from datetime import date
 from ahe.ch02 import read_note, fake_reader
-print(read_note(fake_reader, ch04.NOTES["P044"][0], "anticoagulant", date(2026, 9, 1)))
+print(read_note(fake_reader, ch04.NOTES["P044"][0], "anticoagulant", date(2026, 9, 1))[:2])
 r = run_task(request("P044", 3), ch04.planner_v2, context=ch04.context_v2)
 print(r.hits, r.results["no_anticoag"])'''),
     ])
