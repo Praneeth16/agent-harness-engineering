@@ -6,3 +6,4 @@ __pycache__/
 runs/private/
 .env
 *.env
+*.egg-info/

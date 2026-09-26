@@ -10,6 +10,7 @@ The book builds one harness, chapter by chapter, for a fictional clinical-trial 
 | 2 | Turn domain work into executable contracts | `ahe/ch02.py` | [chapter-02](chapter-02/chapter02.ipynb) |
 | 3 | Build the smallest useful runtime | `ahe/ch03.py` | [chapter-03](chapter-03/chapter03.ipynb) |
 | 4 | Engineer the context layer | `ahe/ch04.py` | [chapter-04](chapter-04/chapter04.ipynb) |
+| 5 | Design tools and the action boundary | `ahe/ch05.py`, `ahe/mcp_server.py` | notebook with the chapter |
 
 ## Layout
 
