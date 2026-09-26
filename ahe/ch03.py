@@ -7,6 +7,7 @@ from .ch02 import (D, NOTES, RECORDS, ContractError, Evidence,
 
 # listing 3.1
 from copy import deepcopy
+from typing import NamedTuple
 from dataclasses import dataclass, field
 from itertools import count
 
@@ -34,7 +35,9 @@ class Run:
     changed: dict = field(default_factory=dict)  # field
     hits: set = field(default_factory=set)   # search hits
     seen: set = field(default_factory=set)   # notes read
+    quotes: dict = field(default_factory=dict)  # real ones
     events: list = field(default_factory=list)
+    registry: object = None  # tools and checks for this run
     reads: int = 0
     cancel: bool = False
 
@@ -48,11 +51,15 @@ class Run:
     def count(self, kind):
         return sum(e["kind"] == kind for e in self.events)
 
-def start(req, budget=None):
+def start(req, budget=None, registry=None):
     req = deepcopy(req)           # the run owns its copy
     protocol = validate(req)      # raises ContractError
+    budget = budget or Budget()
+    if not all(type(v) is int and v >= 0
+               for v in (budget.steps, budget.reads)):
+        raise ContractError("budgets are whole numbers")
     run = Run(f"run-{next(RUN_IDS)}-{req['patient']}", req,
-              protocol, budget or Budget())
+              protocol, budget, registry=registry)
     run.evidence = list(RECORDS[req["patient"]])
     run.record("request", patient=req["patient"],
                protocol=protocol.version)
@@ -78,12 +85,13 @@ def t_read(run, note_id, reader):
     if run.reads >= run.budget.reads:
         raise BudgetExhausted("read budget spent")
     run.reads += 1
-    run.seen.add(note_id)
     note = next(n for n in notes_of(run) if n.id == note_id)
-    item, problem = read_note(reader, note, "anticoagulant",
-                              run.request["on"])
-    run.version += 1
+    run.version += 1              # even if the reader fails
     run.changed["anticoagulant"] = run.version
+    item, problem, quote = read_note(
+        reader, note, "anticoagulant", run.request["on"])
+    run.seen.add(note_id)         # only once it was read
+    run.quotes[note_id] = quote
     if item is None:
         if problem != "no statement in note":
             run.problems[note_id] = problem
@@ -97,11 +105,16 @@ def t_evaluate(run, rule_id):
     on = run.request["on"]
     if isinstance(rule, NoteRule):
         result = judge_note_rule(rule, run.evidence,
-                                 run.problems, on)
+                                 run.problems, on,
+                                 run.quotes)
         unread = sorted(run.hits - run.seen)
         if unread and result.status != "not met":
             result = Result("unknown", "matches not read: "
                             + ", ".join(unread))
+        rest = {n.id for n in notes_of(run)} - run.seen
+        if result.status == "met" and rest:  # absence needs
+            result = Result("unknown",          # every note
+                            f"{len(rest)} notes unread")
     else:
         result = evaluate(rule, run.evidence, on)
     run.results[rule_id] = result
@@ -125,23 +138,36 @@ SPEC = {  # each argument, and the check its value must pass
                       {r.id for r in run.protocol.rules}},
     "finish": {}}
 
+class Registry(NamedTuple):   # one run's tools and checks
+    tools: dict
+    spec: dict
+REGISTRY = Registry(TOOLS, SPEC)
+
+def show(v):
+    try:
+        return repr(v)
+    except Exception:          # a value that will not print
+        return "<unprintable>"
+
 def gate(run, proposal):
+    spec = (run.registry or REGISTRY).spec
     if not isinstance(proposal, dict):
         return "proposal is not an object"
     tool = proposal.get("tool")
     args = proposal.get("args", {})
-    if type(tool) is not str or tool not in SPEC:
-        return f"tool not allowed: {tool}"
-    names = set(SPEC[tool])
+    if type(tool) is not str or tool not in spec:
+        return f"tool not allowed: {show(tool)}"
+    names = set(spec[tool])
     if not isinstance(args, dict) or set(args) != names:
         return f"{tool} takes {sorted(names)}"
-    for name, ok in SPEC[tool].items():
+    for name, ok in spec[tool].items():
         try:
             fine = ok(run, args[name])
         except Exception:        # a check that cannot run
             fine = False         # refuses; it never crashes
         if not fine:
-            return f"bad value for {name}: {args[name]!r}"
+            v = show(args[name])
+            return f"bad value for {name}: {v}"
     return None
 # end listing
 
@@ -164,15 +190,22 @@ def unfinished(run):
             or run.changed.get(r.field, 0)
             > run.computed[r.id]]
 
+def end(run, state, reason):
+    # The one place a run ends, so there is one stop event.
+    run.state, run.reason = state, reason
+    run.record("stop", state=state, reason=reason)
+
 def step(run, planner, reader, context=context_for):
-    ctx = deepcopy(context(run))   # the planner gets a copy
-    have = 2 if "pending" in ctx else 1  # v2: Chapter 4
+    if run.state != "running":
+        raise ContractError(f"{run.id} already {run.state}")
+    have = getattr(context, "schema", 1)  # v2: Chapter 4
     want = getattr(planner, "context_schema", have)
-    if want != have:
+    if want != have:           # checked before building it
         raise ContractError(
             f"planner expects context v{want}, "
             f"harness gives v{have}")
-    proposal = planner(ctx)
+    ctx = deepcopy(context(run))   # the planner gets a copy
+    proposal = deepcopy(planner(ctx))  # detached from it
     if isinstance(proposal, dict):  # keep only what may run
         proposal = {k: proposal[k] for k in ("tool", "args")
                     if k in proposal}
@@ -189,14 +222,14 @@ def step(run, planner, reader, context=context_for):
             run.record("observation",
                        error=f"cannot finish: {todo}")
             return
-        run.state = "completed"
-        run.reason = "every rule has a current result"
         run.record("observation", tool="finish",
                    accepted=True)
-        return
+        return end(run, "completed",
+                   "every rule has a current result")
     if tool == "read_note":
         args = {**args, "reader": reader}
-    observation = TOOLS[tool](run, **args)
+    tools = (run.registry or REGISTRY).tools
+    observation = tools[tool](run, **args)
     run.record("observation", tool=tool, **observation)
 # end listing
 
@@ -207,27 +240,25 @@ def drive(run, planner, reader=fake_reader,
         raise ContractError(f"{run.id} already {run.state}")
     while run.state == "running":
         if run.cancel:
-            run.state = "cancelled"
-            run.reason = "asked to stop"
+            end(run, "cancelled", "asked to stop")
         elif run.count("proposal") >= run.budget.steps:
-            run.state = "blocked"
-            run.reason = "step budget spent"
+            end(run, "blocked", "step budget spent")
         else:
             try:
                 step(run, planner, reader, context)
             except BudgetExhausted as why:
-                run.state, run.reason = "blocked", str(why)
+                run.record("observation", error=str(why))
+                end(run, "blocked", str(why))
             except Exception as why:      # a tool failed
-                run.state = "failed"
-                run.reason = f"{type(why).__name__}: {why}"
-                run.record("observation", error=run.reason)
-    run.record("stop", state=run.state, reason=run.reason)
+                why = f"{type(why).__name__}: {why}"
+                run.record("observation", error=why)
+                end(run, "failed", why)
     return run
 
 def run_task(req, planner, reader=fake_reader, budget=None,
-             context=context_for):
+             context=context_for, registry=None):
     try:
-        run = start(req, budget)
+        run = start(req, budget, registry)
     except ContractError as why:
         return {"status": "refused", "reason": str(why)}
     return drive(run, planner, reader, context)
@@ -235,7 +266,10 @@ def run_task(req, planner, reader=fake_reader, budget=None,
 def packet(run):
     # Chapter 2's packet, from a run in any end state.
     p = run.protocol
-    return {"status": run.state, "reason": run.reason,
+    return {"schema": "packet/3", "status": run.state,
+            "reason": run.reason,
+            "patient": run.request["patient"],
+            "on": run.request["on"],
             "protocol": f"{p.study} v{p.version}",
             "criteria": dict(run.results),
             "unfinished": unfinished(run),
@@ -252,11 +286,12 @@ def fixed_screen(req, reader=fake_reader):
     for rule in run.protocol.rules:
         if not isinstance(rule, NoteRule):
             t_evaluate(run, rule.id)
-    for note_id in t_search(run, SEARCH_TERMS)["notes"]:
-        t_read(run, note_id, reader)
-    t_evaluate(run, "no_anticoag")
-    run.state, run.reason = "completed", "procedure ran"
-    run.record("stop", state=run.state, reason=run.reason)
+    rules = {r.id for r in run.protocol.rules}
+    if "no_anticoag" in rules:     # version 3 and later
+        for note_id in t_search(run, SEARCH_TERMS)["notes"]:
+            t_read(run, note_id, reader)
+        t_evaluate(run, "no_anticoag")
+    end(run, "completed", "procedure ran")
     return run
 # end listing
 

@@ -86,6 +86,7 @@ conditions = {"plain": "ch01_p017_gpt-6-luna", "deadline": "ch01_p017_deadline_g
               "forced answer": "ch01_p017_forced_gpt-6-luna", "both": "ch01_p017_pressure_gpt-6-luna"}
 for name, exp in conditions.items():
     recs = live.records(exp)
+    assert len(recs) == 10, f"{exp}: expected 10 recorded trials, found {len(recs)}"
     verdicts = Counter()
     for r in recs:
         try:
@@ -122,7 +123,7 @@ print(harnessed(task, model=overclaims)["claim_rejected"])'''),
 
 CH2 = notebook(
     "Chapter 2: Turn domain work into executable contracts",
-    "Companion to *Agent Harness Engineering*. Listings 2.1 to 2.6 live in `ahe/ch02.py`.",
+    "Companion to *Agent Harness Engineering*. Listings 2.1 to 2.7 live in `ahe/ch02.py`.",
     [
         md("## 1. The fixtures (Table 2.5)"),
         code('''from ahe import ch02
@@ -146,6 +147,7 @@ for reader in (ch02.fake_reader, ch02.liar, ch02.forger, ch02.drifter, ch02.reda
 from ahe import ch01, live
 by_text = {n.text: (pid, n) for pid, ns in NOTES.items() for n in ns}
 recs = live.records("ch02_reader_gpt-6-luna")
+assert len(recs) == 20, f"expected 20 recorded reads, found {len(recs)}"
 tally = Counter()
 for r in recs:
     pid, n = by_text[r["prompt"].split("Note: ", 1)[1]]
@@ -171,12 +173,14 @@ else:
     print(v, prepare(request("P023", v))["criteria"]["marker"])'''),
         md("### Exercise 2.2\n\nThe coordinator would not pick one: two fresh readings that disagree on the status are `unknown`, and the reason names both. Write the fixture first, then change `evaluate`."),
         code('''from datetime import date
-from ahe.ch02 import Evidence, Result, evaluate, PROTOCOLS
+from ahe.ch02 import Evidence, Result, evaluate, finite, PROTOCOLS
 
 def evaluate_2_2(rule, evidence, on):
     result = evaluate(rule, evidence, on)
+    if result.status == "unknown":
+        return result          # missing, stale, not a number, or wrong unit
     fresh = [e for e in evidence if e.field == rule.field and e.unit == rule.unit
-             and e.observed <= on and (rule.max_age_days is None
+             and finite(e.value) and e.observed <= on and (rule.max_age_days is None
                                        or (on - e.observed).days <= rule.max_age_days)]
     statuses = {rule.lower <= e.value <= rule.upper for e in fresh}
     if len(statuses) > 1:
@@ -188,12 +192,14 @@ marker = PROTOCOLS[1].rules[1]
 readings = [Evidence("x1", "marker", 5, "ng/mL", date(2026, 8, 20)),
             Evidence("x2", "marker", 9, "ng/mL", date(2026, 8, 25))]
 print(evaluate(marker, readings, date(2026, 9, 1)))
-print(evaluate_2_2(marker, readings, date(2026, 9, 1)))'''),
+print(evaluate_2_2(marker, readings, date(2026, 9, 1)))
+broken = [Evidence("x3", "marker", None, "ng/mL", date(2026, 8, 20)), readings[0]]
+print(evaluate_2_2(marker, broken, date(2026, 9, 1)))   # unknown: not a number'''),
         md("### Exercise 2.3\n\nThe stand-in reader sees `warfarin` and a date and reports `present`; the quotation and date are both in the note, so `ground` accepts it and the rule comes out `not met`. The packet's quotation is what lets the reviewer catch the error. Measuring how often it happens needs notes labeled by a person, which Chapter 9 builds."),
         code('''from ahe.ch02 import Note, read_note
 tricky = Note("n99", date(2026, 8, 1),
               "Warfarin was considered on 2026-08-01 and rejected because of bleeding risk.")
-print(read_note(ch02.fake_reader, tricky, "anticoagulant", date(2026, 9, 1)))'''),
+print(read_note(ch02.fake_reader, tricky, "anticoagulant", date(2026, 9, 1))[:2])'''),
     ])
 
 
@@ -217,17 +223,14 @@ for pid in ("P041", "P043"):
 for e in run.events:
     print(e)
 print(packet(run))'''),
-        md("## 4. Replay the recorded live-planner runs (Table 3.5)\n\nThe runtime is deterministic given the planner's replies, so feeding the recorded replies back reproduces each run exactly."),
-        code('''from ahe import ch01, live
-recs = live.records("ch03_planner_gpt-6-luna")
-replies = iter(r["reply"] for r in recs)
-def replay(context):
-    try:
-        return ch01.parse_json(next(replies))
-    except ValueError:
-        return {"tool": None}
-for pid in ["P041"] * 5 + ["P043"] * 5:
-    r = run_task(request(pid, 3), replay)
+        md("## 4. Replay the recorded live-planner runs (Table 3.5)\n\nThe runtime is deterministic given the planner's replies, so feeding the recorded replies back recomputes each run. Every call must rebuild exactly the prompt that was recorded, and every reply must be used; otherwise the cell stops. The saved Chapter 3 records hold calls, not outcomes, so this is a recomputation, checked call by call."),
+        code('''import json
+from ahe import live
+trials = ["P041"] * 5 + ["P043"] * 5
+runs, _ = live.replay("ch03_planner_gpt-6-luna", trials,
+                      lambda c: ch03.PLANNER_PROMPT + json.dumps(c, default=str),
+                      lambda planner, pid: run_task(request(pid, 3), planner))
+for pid, r in zip(trials, runs):
     print(pid, r.state, r.count("proposal"), "steps,", r.reads, "reads,",
           r.results.get("no_anticoag", ("-",))[0])'''),
         md(LIVE_NOTE),
@@ -241,23 +244,54 @@ for pid in ["P041"] * 5 + ["P043"] * 5:
     print(r.state, r.reason)
 else:
     print("Set AHE_LIVE=1 to run the live planner.")'''),
-        md("## Exercise solutions\n\n### Exercise 3.1\n\nA rule: when the step budget is spent and `unfinished(run)` is empty, complete the run with the reason \"budget spent; every rule current\". It is wrong when finishing is itself a decision the planner owes, for example when a later chapter requires a drafted packet or an approval before completion."),
+        md("## Exercise solutions\n\n### Exercise 3.1\n\nA rule: when the step budget is spent and `unfinished(run)` is empty, end the run as completed with the reason \"budget spent; every rule current\". The decision has to be made before the stop is recorded, so the loop below is Chapter 3's `drive` with that one branch changed. It is wrong when finishing is itself a decision the planner owes, for example when a later chapter requires a drafted packet or an approval before completion."),
         code('''def drive_autofinish(run, planner, reader=ch03.fake_reader):
-    run = ch03.drive(run, planner, reader)
-    if run.state == "blocked" and run.reason == "step budget spent" and not ch03.unfinished(run):
-        run.state, run.reason = "completed", "budget spent; every rule current"
-        run.record("stop", state=run.state, reason=run.reason)
-    return run'''),
-        md("### Exercise 3.2\n\nThe gate needs `draft_packet` in `SPEC` with no arguments. The completion check then also requires that a draft exists and that it was drafted after the last change to any rule's evidence."),
+    while run.state == "running":
+        if run.count("proposal") >= run.budget.steps:
+            if ch03.unfinished(run):
+                ch03.end(run, "blocked", "step budget spent")
+            else:
+                ch03.end(run, "completed", "budget spent; every rule current")
+        else:
+            try:
+                ch03.step(run, planner, reader)
+            except ch03.BudgetExhausted as why:
+                run.record("observation", error=str(why))
+                ch03.end(run, "blocked", str(why))
+    return run
+
+def never_finishes(context):       # does the work, never asks to finish
+    p = ch03.fake_planner(context)
+    return p if p["tool"] != "finish" else {"tool": "search_notes", "args": {"terms": ["zzzz"]}}
+r = drive_autofinish(ch03.start(request("P041", 3), ch03.Budget(steps=9)), never_finishes)
+print(r.state, r.reason, "| stops:", r.count("stop"))'''),
+        md("### Exercise 3.2\n\nThe gate needs `draft_packet` in the run's registry with no arguments, and the completion check must now also require a draft made after the last change to the evidence. The planner below drafts before it asks to finish."),
         code('''def t_draft(run):
-    run.draft = packet(run)
-    run.draft_seq = len(run.events)
+    run.draft, run.draft_version = packet(run), run.version
     return {"drafted": sorted(run.draft["criteria"])}
-ch03.TOOLS["draft_packet"] = t_draft
-ch03.SPEC["draft_packet"] = {}
-print(ch03.gate(ch03.start(request("P041", 3)), {"tool": "draft_packet", "args": {}}))
-del ch03.TOOLS["draft_packet"], ch03.SPEC["draft_packet"]'''),
-        md("### Exercise 3.3\n\nRead the proposals the replay prints in section 4. Letting the model choose search terms unwatched is reasonable, because the gate bounds them and `ground` checks what they find. Stopping early is the choice to fixture first: 2 of the 10 recorded runs spent their budget with every rule current."),
+registry = ch03.Registry({**ch03.TOOLS, "draft_packet": t_draft},
+                         {**ch03.SPEC, "draft_packet": {}})
+
+def drafting_planner(context):
+    p = ch03.fake_planner(context)
+    drafted = any("drafted" in e for e in context["observations"])
+    if p["tool"] == "finish" and not drafted:
+        return {"tool": "draft_packet", "args": {}}
+    return p
+
+def step_needing_a_draft(run, planner, reader=ch03.fake_reader):
+    if planner(ch03.context_for(run))["tool"] == "finish" and \\
+            getattr(run, "draft_version", None) != run.version:
+        run.record("proposal", proposal={"tool": "finish"})
+        run.record("observation", error="cannot finish: no current draft")
+        return
+    ch03.step(run, planner, reader)
+
+run = ch03.start(request("P041", 3), registry=registry)
+while run.state == "running" and run.count("proposal") < 14:
+    step_needing_a_draft(run, drafting_planner)
+print(run.state, [e.get("tool") for e in run.events if e["kind"] == "observation"][-3:])'''),
+        md("### Exercise 3.3\n\nRead the proposals the replay prints in section 4. The gate bounds the search terms and `ground` checks what the reads find, but neither measures recall: a planner that searches for the wrong words, reads nothing, and evaluates gets `unknown` without any check failing. Before letting a model choose search terms unwatched, write fixtures that name the notes each search must find, including a brand name and a drug outside the term list. The harness already refuses to conclude absence from a search alone: `met` for the note rule needs every note in scope read."),
     ])
 
 
@@ -279,23 +313,22 @@ ctx = [e for e in run.events if e["kind"] == "context"][3]
 print(ctx["sha"], ctx["chars"], "chars")
 pprint(ctx["bundle"]["pending"])'''),
         md("## 3. Replay the four-context experiment (Table 4.4)"),
-        code('''from ahe import ch01, live
-def replay(experiment, pid, context, n=5):
-    replies = iter(r["reply"] for r in live.records(experiment))
-    def planner(c):
-        try:
-            return ch01.parse_json(next(replies))
-        except ValueError:
-            return {"tool": None}
-    return [run_task(request(pid, 3), planner, budget=Budget(steps=16, reads=6), context=context)
-            for _ in range(n)]
+        code('''import json
+from ahe import live
+arms = (("naive", ch03.context_for), ("assembled", ch04.context_without_terms),
+        ("terms", ch04.context_v2), ("historyterms", ch04.context_history_with_terms),
+        ("allobs", ch04.context_all_observations))
 for pid in ("P042", "P043"):
-    for tag, context in (("naive", ch03.context_for), ("assembled", ch04.context_without_terms),
-                         ("terms", ch04.context_v2),
-                         ("historyterms", ch04.context_history_with_terms)):
-        runs = replay(f"ch04_{pid.lower()}_{tag}_gpt-6-luna", pid, context)
+    for tag, context in arms:
+        exp = f"ch04_{pid.lower()}_{tag}_gpt-6-luna"
+        assert live.records(exp), f"missing recording {exp}"
+        runs, _ = live.replay(exp, [pid] * 5,
+                              lambda c: ch03.PLANNER_PROMPT + json.dumps(c, default=str),
+                              lambda planner, p, context=context: run_task(
+                                  request(p, 3), planner, budget=Budget(steps=16, reads=6),
+                                  context=context))
         done = sum(r.state == "completed" for r in runs)
-        print(pid, f"{tag:10s} completed {done}/5, steps", [r.count("proposal") for r in runs])'''),
+        print(pid, f"{tag:13s} completed {done}/5, steps", [r.count("proposal") for r in runs])'''),
         md(LIVE_NOTE),
         code('''if LIVE:
     live.load_env()
@@ -305,15 +338,17 @@ for pid in ("P042", "P043"):
     print(r.state, r.reason, r.count("proposal"), "steps")
 else:
     print("Set AHE_LIVE=1 to run the live planner on the assembled context.")'''),
-        md("## Exercise solutions\n\n### Exercise 4.1\n\nThe run fails with a named reason, because `fake_planner` declares context version 1. An adapter can map `recent` to `observations`, but it cannot fill `observations` honestly: version 1 promised every observation, and the window holds only the last few. The adapter should say so, for example by adding the archive count, rather than pretend the list is complete."),
+        md("## Exercise solutions\n\n### Exercise 4.1\n\nThe run fails with a named reason, because `fake_planner` declares context version 1. An adapter can map `recent` to `observations`, but it cannot fill `observations` honestly once the window has dropped any: version 1 promised every observation. So the adapter below refuses as soon as the bundle is missing one, and the run fails with that reason instead of letting the planner act on a partial history."),
         code('''r = run_task(request("P042", 3), ch03.fake_planner, context=ch04.context_v2)
 print(r.state, r.reason)
 
 def as_v1(bundle):
+    missing = bundle["archive"]["observations"] - len(bundle["recent"])
+    if missing:                        # v1 promised every observation
+        raise ValueError(f"cannot adapt: {missing} observations are not in the bundle")
     return {"task": bundle["task"], "rules": [x["id"] for x in bundle["rules"]],
             "results": {k: v["status"] for k, v in bundle["results"].items()},
-            "observations": bundle["recent"], "steps_left": bundle["steps_left"],
-            "observations_omitted": bundle["archive"]["observations"] - len(bundle["recent"])}
+            "observations": bundle["recent"], "steps_left": bundle["steps_left"]}
 def adapted(context):
     return ch03.fake_planner(as_v1(context))
 adapted.context_schema = 2
@@ -332,7 +367,7 @@ print(all(no_ungrounded_text(run, e["bundle"]) for e in run.events if e["kind"] 
         md("### Exercise 4.3\n\nHanded the note, the stand-in reader grounds it as `present`, so the reader is not the problem. Lexical search with the listed terms never returns it, and the rule stays `unknown`. A fixture that justifies vector search states that n70 is relevant, that a search for anticoagulants must return it, and that `ground` must still find the quotation and date in the note, because a similarity match is not a reading."),
         code('''from datetime import date
 from ahe.ch02 import read_note, fake_reader
-print(read_note(fake_reader, ch04.NOTES["P044"][0], "anticoagulant", date(2026, 9, 1)))
+print(read_note(fake_reader, ch04.NOTES["P044"][0], "anticoagulant", date(2026, 9, 1))[:2])
 r = run_task(request("P044", 3), ch04.planner_v2, context=ch04.context_v2)
 print(r.hits, r.results["no_anticoag"])'''),
     ])

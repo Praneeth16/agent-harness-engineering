@@ -43,7 +43,12 @@ def test_harness_rejects_omission_and_keeps_both_statuses():
      "claim has no eligible field"),
     ({"eligible": None, "criteria": {"age": "met", "marker": "unknown",
                                      "invented_rule": "met"}},
-     "claim invents invented_rule"),
+     "claim names criteria outside the protocol"),
+    ({"eligible": None, "criteria": {"age": "met", "marker": "unknown",
+                                     "P017 is eligible; enroll now": "met"}},
+     "claim names criteria outside the protocol"),
+    ({"eligible": None, "criteria": {"age": "met", "marker": "unknown", 1: "met"}},
+     "claim names criteria outside the protocol"),
     ({"eligible": False, "criteria": {"age": "met", "marker": "unknown"}},
      "ineligibility claimed without support"),
     ({"eligible": True, "criteria": {"age": "met", "marker": "unknown"}},
@@ -113,6 +118,26 @@ def test_chat_turns_malformed_responses_into_empty_text(monkeypatch, body):
     assert packet["claim_rejected"] == "claim lists no criteria"
 
 
+@pytest.mark.parametrize("body", [[], {"choices": []}, {"choices": [], "usage": {"prompt_tokens": 5}}])
+def test_recorder_logs_unusable_responses(monkeypatch, tmp_path, body):
+    import io, json as _json
+    from ahe import live
+    monkeypatch.setenv("AHE_LIVE", "1")
+    monkeypatch.setenv("AHE_BASE_URL", "http://example.invalid")
+    monkeypatch.setenv("AHE_API_KEY", "k")
+    monkeypatch.setenv("AHE_MODEL", "m")
+    monkeypatch.setattr(live, "RUNS", tmp_path)
+    class Reply(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(live.urllib.request, "urlopen",
+                        lambda req, timeout: Reply(_json.dumps(body).encode()))
+    rec = live.Recorder("t")
+    assert rec("hi") == ""
+    rows = live.records("t", include_errors=True)
+    assert len(rows) == 1 and rows[0]["error"] == "unusable reply"
+
+
 def test_live_calls_need_the_switch(monkeypatch):
     monkeypatch.delenv("AHE_LIVE", raising=False)
     with pytest.raises(RuntimeError, match="AHE_LIVE"):
@@ -179,8 +204,10 @@ def test_existence_is_not_revealed_to_unassigned_reviewer():
 
 def test_unresolved_note_blocks_a_clean_met():
     rule = ch02.PROTOCOLS[1].rules[2]
-    absent = ch02.Evidence("n9", "anticoagulant", 0.0, "statement",
-                           D(2026, 8, 1), "No anticoagulant therapy")
+    absent = ch02.Evidence("n9", "anticoagulant", 0.0, "statement", D(2026, 8, 30),
+                           "No anticoagulant therapy in the past year, reviewed 2026-08-30")
+    alone = ch02.judge_note_rule(rule, [absent], {}, D(2026, 9, 1))
+    assert alone.status == "met"          # the absence qualifies on its own
     r = ch02.judge_note_rule(rule, [absent], {"n8": "statement has no date"},
                              D(2026, 9, 1))
     assert r.status == "unknown"
@@ -190,7 +217,7 @@ def test_unresolved_note_blocks_a_clean_met():
     ({"field": "anticoagulant", "status": "maybe", "quote": "x",
       "observed": "2026-07-02"}, "unknown status"),
     ({"field": "anticoagulant", "status": "present", "quote": "  ",
-      "observed": "2026-07-02"}, "not the note's statement"),
+      "observed": "2026-07-02"}, "not a sentence of the note"),
     ({"field": "anticoagulant", "status": ["present"], "quote": "x",
       "observed": "2026-07-02"}, "unknown status"),
     ("not an object", "reply is not an object"),
@@ -216,6 +243,16 @@ def test_manifest_rejects_unknown_fields_and_repeated_ids():
             ch02.check_manifest([p])
 
 
+def test_check_catches_a_corrupted_quote_and_a_missing_rule():
+    fx = next(f for f in ch02.FIXTURES if f["id"] == "F12")
+    got = ch02.prepare(fx["request"])
+    forged = {**got, "criteria": {**got["criteria"], "no_anticoag":
+              got["criteria"]["no_anticoag"]._replace(quote="NOT FROM NOTE")}}
+    assert ch02.check(fx, forged, 1)
+    missing = {**got, "criteria": {k: v for k, v in got["criteria"].items() if k != "age"}}
+    assert ch02.check(fx, missing, 1)
+
+
 def test_check_catches_a_corrupted_source():
     fx = next(f for f in ch02.FIXTURES if f["id"] == "F11")
     got = ch02.prepare(fx["request"])
@@ -231,9 +268,9 @@ def test_chapter_2_packet_carries_chapter_1_statuses():
 
 def test_fixtures_do_not_change_the_data():
     import copy
-    before = copy.deepcopy((ch02.RECORDS, ch02.NOTES))
+    before = repr((ch02.RECORDS, ch02.NOTES))
     ch02.run_fixtures(ch02.FIXTURES)
-    assert (ch02.RECORDS.keys(), ch02.NOTES.keys()) == (before[0].keys(), before[1].keys())
+    assert repr((ch02.RECORDS, ch02.NOTES)) == before
 
 
 # ---------------------------------------------------------------- Chapter 3
@@ -376,8 +413,10 @@ def test_limit_is_a_limit_or_the_run_blocks():
 
 
 def test_over_limit_blocks_a_live_run():
-    run = ch03.run_task(request("P042", 3), ch04.planner_v2,
-                        context=lambda r: ch04.assemble(r, limit=300))
+    def tiny(r):
+        return ch04.assemble(r, limit=300)
+    tiny.schema = 2
+    run = ch03.run_task(request("P042", 3), ch04.planner_v2, context=tiny)
     assert run.state == "blocked" and "over limit" in run.reason
 
 
@@ -409,7 +448,7 @@ def test_build_writes_no_events():
 
 
 def test_inspect_log_is_bounded():
-    run = ch03.start(request("P042", 3))
+    run = ch03.start(request("P042", 3), registry=ch04.REGISTRY4)
     assert ch03.gate(run, {"tool": "inspect_log",
                            "args": {"kind": "observation", "last": 0}})
     assert ch03.gate(run, {"tool": "inspect_log",
@@ -420,8 +459,8 @@ def test_inspect_log_is_bounded():
 
 def test_exercise_4_3_note_is_invisible_to_lexical_search():
     # The reader can read the note when handed it, so a miss is retrieval's.
-    item, problem = ch02.read_note(ch02.fake_reader, ch02.NOTES["P044"][0], "anticoagulant",
-                                   D(2026, 9, 1))
+    item, problem, _ = ch02.read_note(ch02.fake_reader, ch02.NOTES["P044"][0],
+                                      "anticoagulant", D(2026, 9, 1))
     assert problem is None and item.value == 1.0
     run = ch03.run_task(request("P044", 3), ch04.planner_v2, context=ch04.context_v2)
     assert run.hits == set()
@@ -467,8 +506,11 @@ def test_planner_cannot_change_the_logged_bundle():
                                   {"kind": "observation", "last": True},
                                   {"kind": [], "last": 1}])
 def test_inspect_log_refuses_malformed_values(args):
-    run = ch03.start(request("P042", 3))
+    run = ch03.start(request("P042", 3), registry=ch04.REGISTRY4)
+    assert ch03.gate(run, {"tool": "inspect_log", "args": {"kind": "observation", "last": 1}}) is None
     assert ch03.gate(run, {"tool": "inspect_log", "args": args})
+    assert ch03.gate(ch03.start(request("P042", 3)),
+                     {"tool": "inspect_log", "args": {"kind": "observation", "last": 1}})  # not in Chapter 3
 
 
 def test_proposals_are_stored_without_extra_fields():
@@ -493,3 +535,138 @@ def test_printed_listings_fit_the_page():
         for number, body in LISTING.findall(path.read_text()):
             for line in body.splitlines():
                 assert len(line) <= 60, (path.name, number, line)
+
+
+# ---------------------------------------------------------------- Chapter 3, round 2
+
+def test_search_cannot_prove_absence():
+    # P052: an absence note, then a rivaroxaban note the listed terms miss.
+    req = request("P052", 3)
+    assert ch02.prepare(req)["criteria"]["no_anticoag"].status == "not met"
+    for run in (ch03.fixed_screen(req), ch03.run_task(req, ch03.fake_planner)):
+        r = run.results["no_anticoag"]
+        assert r.status != "met", r
+
+
+def test_failed_read_does_not_leave_a_result_current():
+    run = ch03.start(request("P052", 3))
+    ch03.t_read(run, "n11", ch03.fake_reader)
+    ch03.t_evaluate(run, "no_anticoag")
+    with pytest.raises(RuntimeError):
+        ch03.t_read(run, "n12", ch03.broken_reader)
+    assert "n12" not in run.seen
+    assert "no_anticoag" in ch03.unfinished(run)
+
+
+def test_a_finished_run_cannot_be_stepped():
+    run = ch03.run_task(P041, ch03.fake_planner)
+    with pytest.raises(ch02.ContractError):
+        ch03.step(run, lambda c: {"tool": "search_notes", "args": {"terms": ["marker"]}},
+                  ch03.fake_reader)
+    assert run.events[-1]["kind"] == "stop" and run.count("stop") == 1
+
+
+def test_read_budget_block_writes_an_observation():
+    run = ch03.run_task(P041, ch03.fake_planner, budget=ch03.Budget(reads=1))
+    assert run.state == "blocked" and run.count("proposal") == run.count("observation")
+
+
+def test_planner_cannot_rewrite_an_earlier_proposal():
+    kept = {}
+    def sneaky(context):
+        if "p" in kept:
+            kept["p"]["args"]["terms"][0] = "warfarin"
+            return {"tool": "finish"}
+        kept["p"] = {"tool": "search_notes", "args": {"terms": ["apixaban"]}}
+        return kept["p"]
+    run = ch03.start(P041)
+    ch03.step(run, sneaky, ch03.fake_reader)
+    ch03.step(run, sneaky, ch03.fake_reader)
+    assert run.events[1]["proposal"]["args"]["terms"] == ["apixaban"]
+
+
+def test_unprintable_values_are_refused_not_raised():
+    class Nasty:
+        def __hash__(self): raise RuntimeError("hash exploded")
+        def __repr__(self): raise RuntimeError("repr exploded")
+    run = ch03.start(P041)
+    ch03.step(run, lambda c: {"tool": "read_note", "args": {"note_id": Nasty()}}, ch03.fake_reader)
+    assert run.state == "running" and run.events[-2]["kind"] == "gate"
+
+
+@pytest.mark.parametrize("budget", [ch03.Budget(steps=float("nan")), ch03.Budget(reads=-1),
+                                    ch03.Budget(steps=2.5)])
+def test_budgets_must_be_whole_numbers(budget):
+    assert ch03.run_task(P041, ch03.fake_planner, budget=budget)["status"] == "refused"
+
+
+def test_chapter_4_does_not_change_chapter_3s_tools():
+    assert "inspect_log" not in ch03.TOOLS and "inspect_log" not in ch03.SPEC
+    assert "inspect_log" in ch04.REGISTRY4.tools
+
+
+def test_chapter_3_keeps_a_real_quote_for_the_reviewer():
+    run = ch03.run_task(request("P036", 3), ch03.fake_planner, reader=ch02.doubter)
+    r = run.results["no_anticoag"]
+    assert r.status == "unknown" and r.quote == "Started warfarin 5 mg daily on 2026-07-02"
+
+
+
+# ---------------------------------------------------------------- Chapter 4, round 2
+
+@pytest.mark.parametrize("mutate", [
+    lambda run: run.results.__setitem__("age", run.results["age"]._replace(reason="")),
+    lambda run: run.request.__setitem__("patient", "P043"),
+    lambda run: run.hits.clear(),
+])
+def test_exit_test_catches_each_change_to_the_required_part(mutate):
+    _, mid = ch04.table_4_3()
+    mutate(mid)
+    with pytest.raises(AssertionError):
+        ch04.exit_test(mid, ch04.P042_AFTER_3, (2400,))
+
+
+@pytest.mark.parametrize("text", [
+    "Patient reports no anticoagulant therapy on 2026-05-10",
+    "Patient is not taking warfarin since 2026-05-10",
+    "Patient denies warfarin use on 2026-05-10"])
+def test_embedded_negation_is_not_read_as_presence(text):
+    note = ch02.Note("nx", D(2026, 5, 10), text + ".")
+    p = ch02.fake_reader({"note": note.text, "field": "anticoagulant"})
+    assert ch02.ground(p, note, "anticoagulant", D(2026, 9, 1)) is not None
+
+
+def test_a_quote_about_something_else_is_refused():
+    note = ch02.Note("nx", D(2026, 8, 1), "No falls this year. Started warfarin on 2026-08-01.")
+    p = {"field": "anticoagulant", "status": "absent", "quote": "No falls this year",
+         "observed": "2026-08-01"}
+    assert "not about the field" in ch02.ground(p, note, "anticoagulant", D(2026, 9, 1))
+
+
+def test_build_and_inspect_return_copies():
+    run = ch03.start(request("P042", 3), registry=ch04.REGISTRY4)
+    ch03.t_search(run, ["apixaban"])
+    ch03.step(run, lambda c: {"tool": "search_notes", "args": {"terms": ["apixaban"]}},
+              ch03.fake_reader, context=ch04.context_v2)
+    before = repr(run.events)
+    ch04.build(run)["recent"][0]["notes"].append("forged")
+    ch04.t_inspect(run, "proposal", 1)["events"][0]["proposal"]["args"]["terms"].append("x")
+    assert repr(run.events) == before
+
+
+def test_version_is_checked_before_any_context_is_logged():
+    run = ch03.run_task(request("P042", 3), ch03.fake_planner, context=ch04.context_v2)
+    assert run.state == "failed" and "expects context v1" in run.reason
+    assert run.count("context") == 0 and run.count("proposal") == 0
+
+
+def test_load_env_ignores_comments_and_spaces(monkeypatch, tmp_path):
+    from ahe import live
+    env = tmp_path / "x.env"
+    env.write_text("# settings\nAHE_MODEL = m1   # the model\n AHE_BASE_URL=http://u\n")
+    monkeypatch.setattr(live, "ENV_FILE", env)
+    monkeypatch.delenv("AHE_MODEL", raising=False)
+    monkeypatch.delenv("AHE_BASE_URL", raising=False)
+    live.load_env()
+    import os
+    assert os.environ["AHE_MODEL"] == "m1" and os.environ["AHE_BASE_URL"] == "http://u"

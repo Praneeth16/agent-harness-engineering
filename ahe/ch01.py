@@ -14,7 +14,7 @@ def read_record(patient_id):
     return deepcopy(RECORDS[patient_id])  # never the source
 
 def criterion(value, lower, upper):
-    if value is None:
+    if value is None or value != value:   # missing, or nan
         return "unknown"
     if lower <= value <= upper:
         return "met"
@@ -50,9 +50,8 @@ def check_claim(claim, results):
     omitted = sorted(set(results) - set(named))
     if omitted:
         return "claim omits " + ", ".join(omitted)
-    invented = sorted(set(named) - set(results))
-    if invented:
-        return "claim invents " + ", ".join(invented)
+    if set(named) != set(results):   # the model's own names
+        return "claim names criteria outside the protocol"
     wrong = sorted(n for n in results
                    if named[n] != results[n])
     if wrong:

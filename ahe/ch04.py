@@ -6,7 +6,7 @@ from .ch03 import *            # noqa: F401,F403
 from .ch03 import (D, NOTES, PROTOCOLS, RECORDS, SEARCH_TERMS, SPEC,
                    TOOLS, BudgetExhausted, Evidence, Note, Budget,
                    request, run_task, start, drive, unfinished, words,
-                   context_for)
+                   context_for, Registry)
 
 # listing 4.1
 import hashlib, json
@@ -71,14 +71,15 @@ def build(run, recent=4, limit=2400):
         raise BudgetExhausted(
             f"context over limit: {need} > {limit}")
     for e in reversed(obs[-recent:] if recent else []):
-        trial = {**ctx, "recent": [e] + ctx["recent"]}
+        trial = {**ctx, "recent": [deepcopy(e)]
+                 + ctx["recent"]}
         if size(trial) > limit:
             break               # newest first; oldest drops
         ctx = trial
     return ctx
 
-def assemble(run, recent=4, limit=2400):
-    ctx = build(run, recent, limit)
+def assemble(run, recent=4, limit=2400, extra=None):
+    ctx = {**build(run, recent, limit), **(extra or {})}
     text = json.dumps(ctx, default=str)
     sha = hashlib.sha256(text.encode()).hexdigest()[:12]
     shown = json.loads(text)    # the planner gets a copy;
@@ -91,14 +92,19 @@ def assemble(run, recent=4, limit=2400):
 # listing 4.3
 def t_inspect(run, kind, last):
     picked = [e for e in run.events if e["kind"] == kind]
-    return {"events": [{k: v for k, v in e.items()
-                        if k not in ("kind", "bundle")}
+    keep = lambda e: {k: v for k, v in e.items()
+                      if k not in ("kind", "bundle")}
+    return {"events": [deepcopy(keep(e))
                        for e in picked[-last:]]}
-TOOLS["inspect_log"] = t_inspect
 KINDS = {"proposal", "gate", "observation", "context"}
-SPEC["inspect_log"] = {
-    "kind": lambda run, v: type(v) is str and v in KINDS,
-    "last": lambda run, v: type(v) is int and 1 <= v <= 5}
+def kind_ok(run, v):
+    return type(v) is str and v in KINDS
+def last_ok(run, v):
+    return type(v) is int and 1 <= v <= 5
+REGISTRY4 = Registry(   # Chapter 3's tools plus this one
+    {**TOOLS, "inspect_log": t_inspect},
+    {**SPEC, "inspect_log": {"kind": kind_ok,
+                             "last": last_ok}})
 
 def planner_v2(context):         # reads context v2
     # Works from the derived pending block, not the history.
@@ -125,9 +131,8 @@ def naive_context(run):
             "notes": [asdict(n) for n in notes],
             "events": run.events}
 
-def ranges(ctx):
-    return {(r.get("lower"), r.get("upper"))
-            for r in ctx["rules"]}
+def required(ctx):
+    return {k: v for k, v in ctx.items() if k != "recent"}
 
 def exit_test(run, want, limits):
     # want: the required part, written out by hand.
@@ -138,34 +143,44 @@ def exit_test(run, want, limits):
         except BudgetExhausted as why:
             rows.append((limit, None, None, str(why)))
             continue
-        res = ctx["results"].items()
-        src = {r["source"] for r in ctx["rules"]}
-        got = {"ranges": ranges(ctx), "sources": src,
-               "results": {k: (v["status"], v["source"])
-                           for k, v in res},
-               **ctx["pending"]}
         assert size(ctx) <= limit
+        got = json.loads(json.dumps(required(ctx),
+                                    default=str))
         assert got == want, (limit, got)
         rows.append((limit, size(ctx), len(ctx["recent"]),
                      "hold"))
     return rows
-
-P042_AFTER_3 = {  # P042 v3, stopped after three steps
-    "ranges": {(18, 65), (4, 8), (None, None)},
-    "sources": {"T004 v3"},
-    "results": {"age": ("met", "e23"),
-                "marker": ("met", "e24")},
-    "searched": True,
-    "searched_terms": ["anticoagulant", "apixaban",
-                       "warfarin"],
-    "unread_hits": ["n58", "n61"],
-    "unfinished": ["no_anticoag"],
-    "problems": {}, "reads_left": 4}
 # end listing
+
+
+P042_AFTER_3 = {  # P042 v3 stopped after 3 steps, checked by hand
+    "task": {"patient": "P042", "on": "2026-09-01"},
+    "rules": [
+        {"id": "age", "field": "age", "lower": 18, "upper": 65,
+         "unit": "years", "max_age_days": None, "source": "T004 v3"},
+        {"id": "marker", "field": "marker", "lower": 4, "upper": 8,
+         "unit": "ng/mL", "max_age_days": 90, "source": "T004 v3"},
+        {"id": "no_anticoag", "field": "anticoagulant", "window_days": 180,
+         "source": "T004 v3"}],
+    "results": {
+        "age": {"status": "met", "reason": "50 years on 2026-09-01",
+                "source": "e23", "quote": None},
+        "marker": {"status": "met", "reason": "6.1 ng/mL on 2026-08-24",
+                   "source": "e24", "quote": None}},
+    "pending": {"searched": True,
+                "searched_terms": ["anticoagulant", "apixaban", "warfarin"],
+                "unread_hits": ["n58", "n61"], "unfinished": ["no_anticoag"],
+                "problems": {}, "reads_left": 4},
+    "archive": {"observations": 3, "how": "inspect_log(kind, last<=5)"},
+    "steps_left": 0}
 
 
 def context_v2(run):
     return assemble(run)
+
+
+context_v2.schema = 2
+assemble.schema = 2
 
 
 def context_history_with_terms(run):
@@ -174,7 +189,21 @@ def context_history_with_terms(run):
     return {**context_for(run), "searched_terms": searched_terms(run)}
 
 
-def context_without_terms(run):
+def context_all_observations(run):
+    # Experiment condition E: the Chapter 4 bundle with every observation and
+    # no searched terms, so that only the window length differs from B.
+    ctx = build(run, recent=10_000, limit=10_000_000)
+    del ctx["pending"]["searched_terms"]
+    text = json.dumps(ctx, default=str)
+    run.record("context", chars=len(text), recent=len(ctx["recent"]),
+               sha=hashlib.sha256(text.encode()).hexdigest()[:12], bundle=json.loads(text))
+    return json.loads(text)
+
+
+context_all_observations.schema = 2
+
+
+def context_without_terms(run):  # noqa: D401
     # Experiment condition B in Section 4.5: the assembled bundle as first
     # built, before the pending block listed the terms already searched.
     ctx = build(run)
@@ -219,10 +248,15 @@ NOTES["P044"] = [
 ]
 
 
+def run_task4(req, planner, **kw):
+    """Chapter 4's runs: the assembled context and the Chapter 4 registry."""
+    kw.setdefault("context", context_v2)
+    return run_task(req, planner, registry=REGISTRY4, **kw)
+
+
 def table_4_3():
-    run = run_task(request("P042", 3), planner_v2, context=context_v2)
-    mid = run_task(request("P042", 3), planner_v2, context=context_v2,
-                   budget=Budget(steps=3))
+    run = run_task4(request("P042", 3), planner_v2)
+    mid = run_task4(request("P042", 3), planner_v2, budget=Budget(steps=3))
     return run, mid
 
 
@@ -235,3 +269,6 @@ if __name__ == "__main__":
           "| unread:", sorted(mid.hits - mid.seen))
     for row in exit_test(mid, P042_AFTER_3, (2400, 1200, 900, 500)):
         print(row)
+
+
+context_without_terms.schema = 2
