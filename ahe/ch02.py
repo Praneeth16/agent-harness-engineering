@@ -65,6 +65,8 @@ TERMS = {"anticoagulant": (   # words that make a note count
 PERIODS = {"past year": 365, "past 12 months": 365,
            "past six months": 182}  # how far "no" looks
 MAX_GAP_DAYS = 7   # an absence reviewed this close counts
+MEDS = ("started", " mg", "daily", "prescribed",
+        "commenced", "initiated")   # medication wording
 
 class ContractError(Exception):
     pass
@@ -170,9 +172,14 @@ def ground(p, note, field, on):
     if type(status) is not str or status not in STATUSES:
         return f"unknown status {status!r}"
     said = relevant(note, field)
+    meds = [x for x in sentences(note.text)
+            if any(m in x.lower() for m in MEDS)]
     if status == "none":
-        return ("reader missed a mention" if said
-                else "no statement in note")
+        if said:
+            return "reader missed a mention"
+        if meds:            # a drug the list may not know
+            return "unclassified medication text"
+        return "no statement in note"
     if len(said) > 1:
         return "several statements; needs review"
     q = p.get("quote")
@@ -187,6 +194,8 @@ def ground(p, note, field, on):
     if status == "absent" and not low[1:].startswith(
             NEGATIONS):
         return "quotation does not say absent"
+    if status == "absent" and set(meds) - {q}:
+        return "other medication text; needs review"
     if status == "present" and any(
             f" {n}" in low for n in NEGATIONS):
         return "direction unclear; needs review"
@@ -426,7 +435,20 @@ def garbler(context):
 
 
 # listing 2.7
+SHAPE = {"patient": str, "study": str, "on": date,
+         "by": str}
+
+def check_request(req):
+    if not isinstance(req, dict) or any(
+            type(req.get(k)) is not t
+            for k, t in SHAPE.items()):
+        raise ContractError("request is malformed")
+    v = req.get("version")
+    if v != "current" and type(v) is not int:
+        raise ContractError("version: a number or current")
+
 def validate(req):
+    check_request(req)
     if req["study"] not in ASSIGNED.get(req["by"], set()):
         raise ContractError(f"{req['by']} is not assigned "
                             f"to {req['study']}")

@@ -11,6 +11,7 @@ from ~/.config/ahe/openrouter.env. Nothing here runs unless AHE_LIVE=1.
 
 import datetime as dt
 import json
+import re
 import os
 import time
 import urllib.request
@@ -35,6 +36,8 @@ class Recorder:
     """A drop-in replacement for ch01.chat that records every call."""
 
     def __init__(self, experiment, effort="low"):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", experiment) or ".." in experiment:
+            raise ValueError(f"experiment names are letters, digits, _ . -: {experiment!r}")
         self.experiment = experiment
         self.effort = effort
         self.path = RUNS / f"{experiment}.jsonl"

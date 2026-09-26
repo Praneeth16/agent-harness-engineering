@@ -8,6 +8,8 @@ from .ch04 import (Budget, BudgetExhausted, ContractError, RECORDS, Run,
                    assemble, deepcopy, fake_reader, notes_of,
                    select_protocol, unfinished, words, RUN_IDS)
 from .ch03 import t_read, t_evaluate
+from .ch02 import check_request
+from .ch04 import t_inspect, kind_ok, last_ok
 
 # listing 5.1
 from dataclasses import dataclass
@@ -168,8 +170,8 @@ def submit(run, backend):
                       "call draft_packet again")
     text = json.dumps(run.draft, sort_keys=True,
                       default=str)
-    r = run.request      # one key per request and packet
-    key = (f"{r['patient']}:{r['study']}:{r['version']}:"
+    r, p = run.request, run.protocol   # the version used
+    key = (f"{r['patient']}:{p.study}:{p.version}:"
            f"{r['on']}:{digest(run.draft)}")
     run.receipt = backend.submit(key, text)
     return {"submitted": run.receipt}
@@ -223,6 +225,12 @@ class Harness:
             Tool(READ.name, READ.effect, READ.doc, READ.params,
                  lambda run, note_id: t_read(run, note_id, self.reader)),
             EVALUATE,
+            Tool("inspect_log", "read",
+                 "Return the last 1 to 5 events of one kind from the run's log.",
+                 (Param("kind", str, "proposal, gate, observation, or context", kind_ok,
+                        'e.g. "observation"'),
+                  Param("last", int, "how many, 1 to 5", last_ok, "use 1 to 5")),
+                 t_inspect),
             Tool("draft_packet", "propose",
                  "Assemble the packet from current results.", (), draft),
             Tool("submit_packet", "commit",
@@ -263,7 +271,9 @@ def admit(h, run, proposal):
                       "args", shape)
     name = proposal.get("tool")
     if name == "finish":
-        return None
+        return None if not proposal.get("args") else refuse(
+            "finish got arguments", "it takes none",
+            "send {\"tool\": \"finish\"}")
     if type(name) is not str or name not in h.tools:
         return refuse(f"no tool {preview(name)}",
                       f"tools: {visible(h, run)}",
@@ -284,8 +294,8 @@ def admit(h, run, proposal):
 
 # listing 5.6
 def step(h, run, planner):
-    ctx = deepcopy(assemble(run, limit=h.limit))
-    ctx["tools"] = visible(h, run)
+    ctx = assemble(run, limit=h.limit,     # hashed as given
+                   extra={"tools": visible(h, run)})
     dispatch(h, run, deepcopy(planner(ctx)))
 
 def dispatch(h, run, proposal):
@@ -312,8 +322,12 @@ def dispatch(h, run, proposal):
     tool, args = h.tools[name], proposal.get("args", {})
     out = tool.fn(run, **args)
     run.record("observation", tool=name, **out)
-    for hook in h.after:
-        hook(run, tool, args, h.principal, out)
+    for hook in h.after:   # the call already happened
+        try:
+            hook(run, tool, args, h.principal, out)
+        except Exception as why:
+            run.record("hook_failed", tool=name,
+                       error=f"{type(why).__name__}: {why}")
     return out
 
 def finish(run):
@@ -337,6 +351,14 @@ def finish(run):
 # listing 5.7
 def run_harness(h, req, planner, budget=None):
     req, p = deepcopy(req), h.principal
+    budget = budget or Budget()
+    try:
+        check_request(req)
+        if not all(type(v) is int and v >= 0
+                   for v in (budget.steps, budget.reads)):
+            raise ContractError("budgets are whole numbers")
+    except ContractError as why:
+        return {"status": "refused", "reason": str(why)}
     study = req.get("study")
     if study not in p.studies:             # before lookups
         return {"status": "refused",
@@ -349,7 +371,7 @@ def run_harness(h, req, planner, budget=None):
     if req["patient"] not in RECORDS:
         return {"status": "refused", "reason": "no record"}
     run = Run(f"run-{next(RUN_IDS)}-{req['patient']}",
-              req, protocol, budget or Budget())
+              req, protocol, budget)
     run.evidence = list(RECORDS[req["patient"]])
     run.record("request", patient=req["patient"],
                protocol=protocol.version,

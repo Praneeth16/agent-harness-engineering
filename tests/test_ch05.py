@@ -232,3 +232,104 @@ def test_finish_needs_a_current_draft():
     out = h.dispatch(fresh, {"tool": "finish"})
     assert out["error"] == "cannot finish" and "not current" in out["why"] or "draft" in out["why"]
     assert fresh.state == "running"
+
+
+
+# ---------------------------------------------------------------- full-repository review
+
+def test_unlisted_drug_after_an_absence_goes_to_review(monkeypatch):
+    note = ch05.Note if hasattr(ch05, "Note") else None
+    from ahe import ch02
+    monkeypatch.setitem(ch02.NOTES, "P037", [ch02.Note("n02", ch02.D(2026, 8, 31),
+        "No anticoagulant therapy in the past year, reviewed 2026-08-30. "
+        "Started fondaparinux on 2026-08-31.")])
+    backend = Submissions()
+    run = Harness(COORDINATOR, backend).run(request("P037", 3), planner_v5)
+    assert run.results["no_anticoag"].status == "unknown"
+    assert "medication" in run.results["no_anticoag"].reason
+
+
+def test_unclassified_medication_note_blocks_a_clean_met(monkeypatch):
+    from ahe import ch02
+    monkeypatch.setitem(ch02.NOTES, "P037", ch02.NOTES["P037"] + [
+        ch02.Note("n99", ch02.D(2026, 8, 31), "Started fondaparinux 2.5 mg daily on 2026-08-31.")])
+    got = ch02.prepare(request("P037", 3))["criteria"]["no_anticoag"]
+    assert got.status == "unknown" and "unclassified medication" in got.reason
+
+
+def test_a_failing_after_hook_does_not_undo_a_submit():
+    backend = Submissions()
+    def broken(run, tool, args, principal, result):
+        raise RuntimeError("audit unavailable")
+    run = Harness(COORDINATOR, backend, after=[broken]).run(P042, planner_v5)
+    assert run.state == "completed" and len(backend.stored) == 1
+    assert run.count("hook_failed") >= 1
+
+
+def test_version_aliases_store_one_packet():
+    backend = Submissions()
+    h = Harness(COORDINATOR, backend)
+    a = h.run(request("P042", 3), planner_v5)
+    b = h.run(request("P042", "current"), planner_v5)
+    assert a.receipt == b.receipt and len(backend.stored) == 1
+
+
+def test_deeply_nested_mcp_input_gets_a_parse_error():
+    replies = mcp(["[" * 10_000 + "\n", {"jsonrpc": "2.0", "id": 7, "method": "initialize"}])
+    assert replies[None]["error"]["code"] == -32700 and "result" in replies[7]
+
+
+def test_logged_context_is_what_the_planner_got():
+    import hashlib
+    seen = []
+    def spy(context):
+        seen.append(json.dumps(context, default=str))
+        return planner_v5(context)
+    run = Harness(COORDINATOR, Submissions()).run(P042, spy)
+    logged = [e for e in run.events if e["kind"] == "context"]
+    assert [hashlib.sha256(t.encode()).hexdigest()[:12] for t in seen] == [e["sha"] for e in logged]
+
+
+@pytest.mark.parametrize("req", [{**P042, "on": "2026-09-01"}, {**P042, "version": 3.0},
+                                 {k: v for k, v in P042.items() if k != "patient"}])
+def test_malformed_requests_are_refused_everywhere(req):
+    from ahe import ch02, ch03
+    assert ch02.prepare(req)["status"] == "refused"
+    assert ch03.run_task(req, ch03.fake_planner)["status"] == "refused"
+    assert Harness(COORDINATOR, Submissions()).run(req, planner_v5)["status"] == "refused"
+
+
+def test_negative_budgets_are_refused_in_chapter_5():
+    out = Harness(COORDINATOR, Submissions()).run(P042, planner_v5, budget=ch05.Budget(steps=-1))
+    assert out["status"] == "refused"
+
+
+def test_fixed_program_runs_on_version_2():
+    from ahe import ch03
+    run = ch03.fixed_screen(request("P017", 2))
+    assert run.state == "completed" and set(run.results) == {"age", "marker"}
+
+
+def test_finish_takes_no_arguments():
+    h = Harness(COORDINATOR, Submissions())
+    run = start(P042)
+    assert h.admit(run, {"tool": "finish", "args": {"unexpected": 1}})["error"] == "finish got arguments"
+
+
+def test_nan_is_unknown_in_chapter_1_too():
+    from ahe import ch01
+    assert ch01.criterion(float("nan"), 3, 7) == "unknown"
+
+
+@pytest.mark.parametrize("name", ["../outside", "a/b", ".hidden", ""])
+def test_experiment_names_stay_inside_runs(name):
+    from ahe import live
+    with pytest.raises(ValueError):
+        live.Recorder(name)
+
+
+def test_inspect_log_is_a_chapter_5_tool():
+    h = Harness(COORDINATOR, Submissions())
+    run = start(P042)
+    assert "inspect_log" in h.visible(run)
+    assert h.admit(run, {"tool": "inspect_log", "args": {"kind": "observation", "last": 3}}) is None

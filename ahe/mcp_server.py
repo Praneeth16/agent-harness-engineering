@@ -67,8 +67,10 @@ class Server:
             if not line.strip():
                 continue
             try:
+                if len(line) > 1_000_000:
+                    raise ValueError("line too long")
                 msg = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 write(json.dumps({"jsonrpc": "2.0", "id": None,
                                   "error": {"code": -32700, "message": "parse error"}}) + "\n")
                 continue

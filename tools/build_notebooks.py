@@ -86,6 +86,7 @@ conditions = {"plain": "ch01_p017_gpt-6-luna", "deadline": "ch01_p017_deadline_g
               "forced answer": "ch01_p017_forced_gpt-6-luna", "both": "ch01_p017_pressure_gpt-6-luna"}
 for name, exp in conditions.items():
     recs = live.records(exp)
+    assert len(recs) == 10, f"{exp}: expected 10 recorded trials, found {len(recs)}"
     verdicts = Counter()
     for r in recs:
         try:
@@ -146,6 +147,7 @@ for reader in (ch02.fake_reader, ch02.liar, ch02.forger, ch02.drifter, ch02.reda
 from ahe import ch01, live
 by_text = {n.text: (pid, n) for pid, ns in NOTES.items() for n in ns}
 recs = live.records("ch02_reader_gpt-6-luna")
+assert len(recs) == 20, f"expected 20 recorded reads, found {len(recs)}"
 tally = Counter()
 for r in recs:
     pid, n = by_text[r["prompt"].split("Note: ", 1)[1]]
@@ -319,8 +321,7 @@ arms = (("naive", ch03.context_for), ("assembled", ch04.context_without_terms),
 for pid in ("P042", "P043"):
     for tag, context in arms:
         exp = f"ch04_{pid.lower()}_{tag}_gpt-6-luna"
-        if not live.records(exp):
-            continue
+        assert live.records(exp), f"missing recording {exp}"
         runs, _ = live.replay(exp, [pid] * 5,
                               lambda c: ch03.PLANNER_PROMPT + json.dumps(c, default=str),
                               lambda planner, p, context=context: run_task(

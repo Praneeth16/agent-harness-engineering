@@ -286,9 +286,11 @@ def fixed_screen(req, reader=fake_reader):
     for rule in run.protocol.rules:
         if not isinstance(rule, NoteRule):
             t_evaluate(run, rule.id)
-    for note_id in t_search(run, SEARCH_TERMS)["notes"]:
-        t_read(run, note_id, reader)
-    t_evaluate(run, "no_anticoag")
+    rules = {r.id for r in run.protocol.rules}
+    if "no_anticoag" in rules:     # version 3 and later
+        for note_id in t_search(run, SEARCH_TERMS)["notes"]:
+            t_read(run, note_id, reader)
+        t_evaluate(run, "no_anticoag")
     end(run, "completed", "procedure ran")
     return run
 # end listing

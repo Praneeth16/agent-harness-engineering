@@ -78,8 +78,8 @@ def build(run, recent=4, limit=2400):
         ctx = trial
     return ctx
 
-def assemble(run, recent=4, limit=2400):
-    ctx = build(run, recent, limit)
+def assemble(run, recent=4, limit=2400, extra=None):
+    ctx = {**build(run, recent, limit), **(extra or {})}
     text = json.dumps(ctx, default=str)
     sha = hashlib.sha256(text.encode()).hexdigest()[:12]
     shown = json.loads(text)    # the planner gets a copy;

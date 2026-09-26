@@ -14,7 +14,7 @@ def read_record(patient_id):
     return deepcopy(RECORDS[patient_id])  # never the source
 
 def criterion(value, lower, upper):
-    if value is None:
+    if value is None or value != value:   # missing, or nan
         return "unknown"
     if lower <= value <= upper:
         return "met"
