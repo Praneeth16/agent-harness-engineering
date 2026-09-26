@@ -373,8 +373,141 @@ print(r.hits, r.results["no_anticoag"])'''),
     ])
 
 
+CH5 = notebook(
+    "Chapter 5: Design tools and the action boundary",
+    "Companion to *Agent Harness Engineering*. Listings 5.1 to 5.9 live in `ahe/ch05.py`; "
+    "the MCP server is `ahe/mcp_server.py`, and the experiment driver is `tools/record_ch05.py`.",
+    [
+        md("## 1. One declaration, two readers\n\nThe tool text the model reads is written from the same `Param` records the gate checks."),
+        code('''from ahe import ch05
+from ahe.ch02 import request
+from ahe.ch03 import start, Budget
+from ahe.ch05 import Harness, Submissions, COORDINATOR, REVIEWER_A, OUTSIDER, planner_v5
+h = Harness(COORDINATOR, Submissions())
+tools = [h.tools[n] for n in h.visible(start(request("P042", 3)))]
+print(ch05.describe(tools, full=False))
+print()
+print(ch05.describe(tools, full=True))'''),
+        md("## 2. Refusals that say what, why, and how to fix"),
+        code('''run = start(request("P042", 3))
+for args in ({"terms": "warfarin", "page": 1}, {"terms": ["warfarin"], "page": True},
+             {"terms": ["warfarin"]}, {"terms": ["x" * 10_000], "page": 1}):
+    print(ch05.check_args(run, ch05.SEARCH, args))'''),
+        md("## 3. A coordinator submits once; a reviewer cannot"),
+        code('''backend = Submissions()
+coord = Harness(COORDINATOR, backend)
+a = coord.run(request("P042", 3), planner_v5)
+b = coord.run(request("P042", "current"), planner_v5)        # same request, version alias
+print(a.state, a.receipt, b.receipt, "stored:", len(backend.stored), "backend calls:", backend.calls)
+reviewer = Harness(REVIEWER_A, Submissions())
+r = reviewer.run(request("P042", 3), planner_v5)
+print(r.state, "visible:", reviewer.visible(r))
+print(reviewer.admit(r, {"tool": "submit_packet", "args": {}}))
+print(Harness(OUTSIDER, Submissions()).run(request("P042", 999), planner_v5))'''),
+        md("## 4. The exit test (Table 5.4)"),
+        code('''for pid in ("P042", "P043"):
+    print(pid)
+    for row in ch05.exit_test(request(pid, 3)):
+        print("  ", row)
+    print("   control:", ch05.attempt(request(pid, 3), ch05.CONTROL))'''),
+        md("## 5. The same gate over MCP (Table 5.3)"),
+        code('''import json
+from ahe import mcp_server
+server = mcp_server.Server(Harness(REVIEWER_A, Submissions()), start(request("P042", 3)))
+msgs = [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "submit_packet", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "search_notes", "arguments": {"terms": "apixaban", "page": 1}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+         "params": {"name": "search_notes", "arguments": {"terms": ["apixaban"], "page": 1}}}]
+server.serve([json.dumps(m) for m in msgs], print)'''),
+        md("## 6. Replay the tool-text experiment (Table 5.1)\n\nEvery recorded reply goes back through the harness. The replay fails if a rebuilt prompt differs from the recorded one, if a reply is missing or left over, or if a run ends differently from its recorded outcome."),
+        code('''import sys
+from collections import Counter
+from ahe import live
+sys.path.insert(0, str(root / "tools"))
+import record_ch05 as rc
+
+def prompt_of(full):
+    probe = Harness(COORDINATOR, Submissions())
+    return lambda c: (ch05.PLANNER5 + ch05.describe([probe.tools[n] for n in c["tools"]], full)
+                      + "\\nRun so far:\\n" + json.dumps(c, default=str))
+
+for arm, full, teach, skill in rc.ARMS:
+    exp = f"ch05_{arm}_gpt-6-luna"
+    assert live.records(exp), f"missing recording {exp}"
+    plan = [p for p in rc.PATIENTS for _ in range(rc.TRIALS)]
+    runs, recs = live.replay(exp, plan, prompt_of(full), lambda planner, pid: Harness(
+        COORDINATOR, Submissions(), teach=teach, skill=skill).run(request(pid, 3), planner, budget=rc.BUDGET))
+    used = Counter(e["proposal"].get("tool") for r in runs for e in r.events
+                   if e["kind"] == "proposal" and isinstance(e["proposal"], dict))
+    print(f"{arm:24s} completed {sum(r.state == 'completed' for r in runs)}/{len(runs)}",
+          f"inspect_log {used['inspect_log']}, cost ${sum(x.get('cost_usd') or 0 for x in recs):.4f}")'''),
+        md(LIVE_NOTE),
+        code('''if LIVE:
+    from ahe import ch01
+    live.load_env()
+    ch01.chat = live.Recorder("my_ch05_full")
+    h = Harness(COORDINATOR, Submissions())
+    r = h.run(request("P042", 3), ch05.live_planner5(h, full=True), budget=rc.BUDGET)
+    print(r.state, r.reason, r.count("proposal"), "steps")
+else:
+    print("Set AHE_LIVE=1 to run the live planner with the Chapter 5 tools.")'''),
+        md("## Exercise solutions\n\n### Exercise 5.1\n\n`withdraw_packet` commits, so `authorize` refuses it for a reviewer with `may not submit` before any tool code runs. Its `receipt` parameter is valid only for receipts the backend holds for this run's patient, so a coordinator quoting another patient's receipt is refused by the argument check. Neither call reaches the backend."),
+        code('''from ahe.ch05 import Tool, Param
+class Withdrawable(Submissions):
+    def withdraw(self, receipt):
+        self.calls += 1
+        self.stored = {k: v for k, v in self.stored.items() if v[0] != receipt}
+        return {"withdrawn": receipt}
+
+backend = Withdrawable()
+other = Harness(COORDINATOR, backend).run(request("P043", 3), planner_v5).receipt
+def own(run, receipt):
+    return any(v[0] == receipt and k.startswith(run.request["patient"] + ":")
+               for k, v in backend.stored.items())
+WITHDRAW = Tool("withdraw_packet", "commit", "Withdraw a submitted packet.",
+                (Param("receipt", str, "a receipt for this patient", own,
+                       "use the receipt submit_packet returned"),),
+                lambda run, receipt: backend.withdraw(receipt))
+for who, receipt in ((REVIEWER_A, other), (COORDINATOR, other)):
+    h = Harness(who, backend)
+    h.tools["withdraw_packet"] = WITHDRAW
+    run = ch05.ready(Harness(COORDINATOR, backend), request("P042", 3))
+    before = backend.calls
+    print(who.name, ch05.dispatch(h, run, {"tool": "withdraw_packet", "args": {"receipt": receipt}}),
+          "backend calls:", backend.calls - before)'''),
+        md("### Exercise 5.2\n\nReplacing `ch05.refuse` drops `fix` from every refusal the gate builds, because `check_args`, `authorize`, and `admit` call it at the moment they refuse. The stand-in planner below shows the shape of what the live planner would see; run the live cell with your own experiment name to measure it."),
+        code('''original = ch05.refuse
+ch05.refuse = lambda what, why, fix: {"error": what, "why": why}
+try:
+    print(ch05.check_args(start(request("P042", 3)), ch05.SEARCH, {"terms": "warfarin", "page": 1}))
+    if LIVE:
+        from ahe import ch01
+        ch01.chat = live.Recorder("my_ch05_no_fix")
+        h = Harness(COORDINATOR, Submissions())
+        r = h.run(request("P042", 3), ch05.live_planner5(h, full=False), budget=rc.BUDGET)
+        print(r.state, r.count("gate"), "refusals")
+finally:
+    ch05.refuse = original'''),
+        md("### Exercise 5.3\n\nThe specification says a client SHOULD pass tool execution errors (`isError`) to the model, so it can correct itself, and MAY pass protocol errors, which a model is less likely to recover from. So the bad `terms` value should reach the model with its `fix`, and the unknown `submit_packet` is the one to show you. Here is the same exchange against the server as a separate process."),
+        code('''import subprocess
+msgs = [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "search_notes", "arguments": {"terms": "warfarin", "page": 1}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "submit_packet", "arguments": {}}}]
+done = subprocess.run([sys.executable, "-m", "ahe.mcp_server", "P042"], cwd=root, text=True,
+                      input="".join(json.dumps(m) + "\\n" for m in msgs), capture_output=True, timeout=30)
+assert done.returncode == 0, done.stderr
+for line in done.stdout.splitlines():
+    print(line[:160])'''),
+    ])
+
+
 if __name__ == "__main__":
-    for n, nb in enumerate((CH1, CH2, CH3, CH4), start=1):
+    for n, nb in enumerate((CH1, CH2, CH3, CH4, CH5), start=1):
         path = ROOT / f"chapter-0{n}" / f"chapter0{n}.ipynb"
         path.parent.mkdir(exist_ok=True)
         nbf.write(nb, path)

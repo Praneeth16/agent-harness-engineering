@@ -361,5 +361,37 @@ def test_exit_test_fails_without_authorization(monkeypatch):
 
 def test_exit_test_fails_without_the_argument_check(monkeypatch):
     monkeypatch.setattr(ch05, "check_args", lambda run, tool, args: None)
-    with pytest.raises((AssertionError, TypeError, StopIteration)):
+    with pytest.raises(TypeError, match="force"):
         ch05.exit_test(P042)
+
+
+@pytest.mark.parametrize("page", [True, 1.0])
+def test_exact_types_refuse_bools_and_floats(page):
+    problem = check_args(start(P042), ch05.SEARCH, {"terms": ["warfarin"], "page": page})
+    assert problem["error"].startswith("bad page")
+
+
+def test_a_validity_check_that_raises_is_a_refusal():
+    def boom(run, v):
+        raise RuntimeError("check broke")
+    tool = ch05.Tool("t", "read", "", (ch05.Param("x", str, "any", boom, "fix"),), None)
+    assert check_args(start(P042), tool, {"x": "y"})["error"] == 'bad x: "y"'
+
+
+def test_a_tool_that_raises_under_mcp_is_an_error_result():
+    from ahe import mcp_server
+    out = []
+    run = start(P042, ch05.Budget(steps=24, reads=0))
+    server = mcp_server.Server(Harness(REVIEWER_A, Submissions()), run)
+    msgs = [call(1, "search_notes", {"terms": ["apixaban"], "page": 1}),
+            call(2, "read_note", {"note_id": "n58"}),
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}]
+    server.serve([json.dumps(m) for m in msgs], lambda s: out.append(json.loads(s)))
+    assert out[1]["result"]["isError"] is True
+    assert "BudgetExhausted" in out[1]["result"]["content"][0]["text"]
+    assert "tools" in out[2]["result"]
+
+
+def test_ready_stops_when_the_principal_cannot_submit():
+    with pytest.raises(ValueError, match="completed before a submit"):
+        ch05.ready(Harness(REVIEWER_A, Submissions()), P042)

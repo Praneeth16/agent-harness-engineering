@@ -493,13 +493,14 @@ def ready(h, req):
     # A run one step from submitting: every rule current,
     # the packet drafted, nothing sent.
     run = start(req, Budget(steps=24, reads=6))
-    while True:
+    while run.state == "running":
         ctx = assemble(run, limit=h.limit,
                        extra={"tools": visible(h, run)})
         proposal = planner_v5(ctx)
         if proposal["tool"] == "submit_packet":
             return run
         dispatch(h, run, proposal)
+    raise ValueError(f"run {run.state} before a submit")
 
 def attempt(req, case):
     # Returns what the call got, and how many backend
