@@ -158,8 +158,7 @@ def test_mcp_calls_go_through_the_same_gate():
     names = [t["name"] for t in replies[2]["result"]["tools"]]
     assert "submit_packet" not in names and "search_notes" in names
     assert json.loads(replies[3]["result"]["content"][0]["text"])["notes"] == ["n58"]
-    assert replies[4]["result"]["isError"] is True
-    assert "no tool" in replies[4]["result"]["content"][0]["text"]
+    assert replies[4]["error"]["code"] == -32602 and "unknown tool" in replies[4]["error"]["message"]
     assert replies[5]["result"]["isError"] is True
     assert "bad terms" in replies[5]["result"]["content"][0]["text"]
 
@@ -171,7 +170,7 @@ def test_mcp_survives_malformed_messages_and_failing_tools():
                    call(4, "search_notes", {"terms": ["apixaban"], "page": 1}),
                    call(5, "read_note", {"note_id": "n58"})])
     assert replies[None]["error"]["code"] == -32700
-    assert replies[2]["result"]["isError"] and "no tool" in replies[2]["result"]["content"][0]["text"]
+    assert replies[2]["error"]["code"] == -32602 and "result" not in replies[2]
     assert replies[3]["result"]["isError"] and "bad note_id" in replies[3]["result"]["content"][0]["text"]
     assert replies[5]["result"]["isError"] is False
 
@@ -343,3 +342,24 @@ def test_inspect_log_is_a_chapter_5_tool():
     run = start(P042)
     assert "inspect_log" in h.visible(run)
     assert h.admit(run, {"tool": "inspect_log", "args": {"kind": "observation", "last": 3}}) is None
+
+
+# ---------------------------------------------------------------- exit test
+
+def test_exit_test_holds_on_both_patients():
+    for pid in ("P042", "P043"):
+        rows = ch05.exit_test(request(pid, 3))
+        assert len(rows) == len(ch05.HOSTILE)
+        assert all(err != "accepted" for _, err, _, _ in rows)
+
+
+def test_exit_test_fails_without_authorization(monkeypatch):
+    monkeypatch.setattr(ch05, "authorize", lambda principal, tool, run: None)
+    with pytest.raises(AssertionError):
+        ch05.exit_test(P042)
+
+
+def test_exit_test_fails_without_the_argument_check(monkeypatch):
+    monkeypatch.setattr(ch05, "check_args", lambda run, tool, args: None)
+    with pytest.raises((AssertionError, TypeError, StopIteration)):
+        ch05.exit_test(P042)

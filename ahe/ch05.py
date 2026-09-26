@@ -447,6 +447,86 @@ COORDINATOR = Principal("coordinator-1", frozenset({"T004"}), may_submit=True)
 OUTSIDER = Principal("reviewer-b", frozenset({"T009"}))
 
 
+# The exit test: calls that must not reach the backend or the reader.
+SUBMIT = {"tool": "submit_packet", "args": {}}
+READ_ONLY = Skill("read-only", "Screen without drafting or sending.",
+                  frozenset({"search_notes", "read_note", "evaluate_rule"}), "")
+
+
+def no_commits(run, tool, args, principal):
+    if tool.effect == "commit":
+        return refuse("commits paused", "a hook vetoed it", "try later")
+
+
+def stale(run):
+    run.version += 1                  # new evidence arrives
+
+
+def over(run):
+    run.state = "completed"
+
+
+def spent(run):
+    run.budget.steps = run.count("proposal")
+
+
+HOSTILE = (   # (case, principal, harness options, proposal, change to the run)
+    ("not an object", COORDINATOR, {}, "submit_packet", None),
+    ("unknown tool", COORDINATOR, {}, {"tool": "send_packet", "args": {}}, None),
+    ("extra argument", COORDINATOR, {}, {"tool": "submit_packet", "args": {"force": True}}, None),
+    ("wrong type", COORDINATOR, {}, {"tool": "read_note", "args": {"note_id": 58}}, None),
+    ("note no search returned", COORDINATOR, {}, {"tool": "read_note", "args": {"note_id": "n40"}}, None),
+    ("another patient's note", COORDINATOR, {}, {"tool": "read_note", "args": {"note_id": "n25"}}, None),
+    ("reviewer submits", REVIEWER_A, {}, SUBMIT, None),
+    ("other study", OUTSIDER, {}, SUBMIT, None),
+    ("hook vetoes", COORDINATOR, {"before": (no_commits,)}, SUBMIT, None),
+    ("outside the skill", COORDINATOR, {"skill": READ_ONLY}, SUBMIT, None),
+    ("stale draft", COORDINATOR, {}, SUBMIT, stale),
+    ("run already over", COORDINATOR, {}, SUBMIT, over),
+    ("step budget spent", COORDINATOR, {}, SUBMIT, spent),
+)
+CONTROL = ("valid submit", COORDINATOR, {}, SUBMIT, None)
+
+
+# listing 5.9
+def ready(h, req):
+    # A run one step from submitting: every rule current,
+    # the packet drafted, nothing sent.
+    run = start(req, Budget(steps=24, reads=6))
+    while True:
+        ctx = assemble(run, limit=h.limit,
+                       extra={"tools": visible(h, run)})
+        proposal = planner_v5(ctx)
+        if proposal["tool"] == "submit_packet":
+            return run
+        dispatch(h, run, proposal)
+
+def attempt(req, case):
+    # Returns what the call got, and how many backend
+    # calls and reader calls it caused.
+    _, who, options, proposal, change = case
+    backend, shown = Submissions(), []
+    def reader(ctx):
+        shown.append(ctx["note"])
+        return fake_reader(ctx)
+    run = ready(Harness(COORDINATOR, backend, reader), req)
+    before = backend.calls, len(shown)
+    if change:
+        change(run)
+    h = Harness(who, backend, reader, **options)
+    out = dispatch(h, run, deepcopy(proposal))
+    return (out.get("error", "accepted"),
+            backend.calls - before[0],
+            len(shown) - before[1])
+
+def exit_test(req):
+    rows = [(c[0], *attempt(req, c)) for c in HOSTILE]
+    assert all(b == r == 0 for _, _, b, r in rows), rows
+    assert attempt(req, CONTROL)[1] == 1   # the gate is
+    return rows                             # not just shut
+# end listing
+
+
 PLANNER5 = """You run one step of a screening task for a clinical-trial reviewer.
 Screen the patient against every rule of the protocol, draft the packet, submit it if
 submit_packet is among your tools, then finish. Reply with JSON only:

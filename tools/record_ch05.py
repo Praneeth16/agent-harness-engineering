@@ -3,9 +3,10 @@
 Three arms, two patients, five trials each, under COORDINATOR with a fresh backend per trial.
 Each call and each trial's outcome go to runs/ch05_<arm>_<model>.jsonl, which the book replays.
 
-    AHE_LIVE=1 python tools/record_ch05.py
+    AHE_LIVE=1 python tools/record_ch05.py [arm ...]      # arms may run in parallel
 """
 
+import sys
 import time
 
 from ahe import ch01, ch05, live
@@ -31,9 +32,11 @@ def patient(rec):
     return chat
 
 
-def main():
+def main(names):
     assert live.load_env(), "set AHE_LIVE=1 and AHE_API_KEY"
     for arm, full, teach in ARMS:
+        if names and arm not in names:
+            continue
         rec = live.Recorder(f"ch05_{arm}_gpt-6-luna")
         ch01.chat = patient(rec)
         for pid in PATIENTS:
@@ -51,4 +54,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

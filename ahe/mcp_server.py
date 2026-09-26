@@ -8,7 +8,8 @@ tool reached over MCP obeys exactly the checks a tool reached in-process does.
     python -m ahe.mcp_server P042        # one JSON-RPC message per line on stdin
 
 Standard library only. It implements initialize, tools/list, and tools/call,
-the subset a client needs to discover and call tools.
+the subset a client needs to discover and call tools; it does not check the
+_meta fields the specification requires on each request.
 """
 
 import json
@@ -32,6 +33,10 @@ def schema(tool):
             "required": [p.name for p in tool.params], "additionalProperties": False}
 
 
+class UnknownTool(Exception):
+    """A protocol error in MCP, not a tool result: the spec's code -32602."""
+
+
 class Server:
     def __init__(self, harness, run):
         self.harness, self.run = harness, run
@@ -48,17 +53,16 @@ class Server:
         if method == "tools/call":
             name = params.get("name")
             if name not in self.harness.visible(self.run):   # finish is not a tool
-                problem = ch05.refuse(f"no tool {ch05.preview(name)}",
-                                      f"tools: {self.harness.visible(self.run)}",
-                                      "use one of the listed tools")
-                return {"content": [{"type": "text", "text": json.dumps(problem)}], "isError": True}
+                raise UnknownTool(f"unknown tool {ch05.preview(name)}; "
+                                  f"tools: {self.harness.visible(self.run)}")
             proposal = {"tool": name, "args": params.get("arguments", {})}
             try:
                 out = self.harness.dispatch(self.run, proposal)
             except Exception as why:            # a tool failed: report it, keep serving
                 out = {"error": f"{type(why).__name__}: {why}"}
                 self.run.record("observation", **out)
-            return {"content": [{"type": "text", "text": json.dumps(out, default=str)}],
+            return {"resultType": "complete",
+                    "content": [{"type": "text", "text": json.dumps(out, default=str)}],
                     "isError": "error" in out}
         raise KeyError(method)
 
@@ -78,6 +82,9 @@ class Server:
                 continue
             try:
                 reply = {"jsonrpc": "2.0", "id": msg["id"], "result": self.handle(msg)}
+            except UnknownTool as why:
+                reply = {"jsonrpc": "2.0", "id": msg["id"],
+                         "error": {"code": -32602, "message": str(why)}}
             except KeyError as why:
                 reply = {"jsonrpc": "2.0", "id": msg["id"],
                          "error": {"code": -32601, "message": f"no method {why}"}}
