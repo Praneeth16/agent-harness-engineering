@@ -102,11 +102,17 @@ def test_a_hook_can_refuse_and_nothing_reaches_the_backend():
     assert any(e.get("refused", {}).get("error") == "commits paused" for e in run.events)
 
 
-def test_audit_hook_records_every_admitted_call():
+def test_audit_hook_records_only_calls_that_ran():
     log = []
-    run = Harness(COORDINATOR, Submissions(), before=[ch05.audit(log)]).run(P042, planner_v5)
-    tools = [t for _, _, t, _ in log]
-    assert tools.count("submit_packet") == 1 and all(p == "coordinator-1" for _, p, _, _ in log)
+    def deny_submit(run, tool, args, principal):
+        if tool.effect == "commit":
+            return ch05.refuse("paused", "maintenance", "later")
+    h = Harness(COORDINATOR, Submissions(), before=[deny_submit], after=[ch05.audit(log)])
+    h.run(P042, planner_v5, budget=ch05.Budget(steps=12))
+    assert "submit_packet" not in [t for _, _, t, _ in log]
+    log2 = []
+    Harness(COORDINATOR, Submissions(), after=[ch05.audit(log2)]).run(P042, planner_v5)
+    assert [t for _, _, t, _ in log2].count("submit_packet") == 1
 
 
 def test_terse_errors_hide_the_reason_from_the_planner():
@@ -120,26 +126,109 @@ def test_a_skill_cannot_grant_a_tool():
     skill = ch05.load_skill(ROOT / "skills/screen-anticoagulant-notes/SKILL.md")
     assert "submit_packet" in skill.wants
     run = start(P042)
-    assert "submit_packet" not in ch05.with_skill(Harness(REVIEWER_A, Submissions()), run, skill)
-    assert "submit_packet" in ch05.with_skill(Harness(COORDINATOR, Submissions()), run, skill)
+    reviewer = ch05.with_skill(Harness(REVIEWER_A, Submissions()), skill)
+    assert "submit_packet" not in reviewer.visible(run)
+    assert "submit_packet" in ch05.with_skill(Harness(COORDINATOR, Submissions()), skill).visible(run)
+    narrow = ch05.Skill("read-only", "x", frozenset({"search_notes"}), "")
+    h = ch05.with_skill(Harness(COORDINATOR, Submissions()), narrow)
+    assert h.visible(run) == ["search_notes"]
+    assert "outside the skill" in h.admit(run, {"tool": "evaluate_rule", "args": {"rule_id": "age"}})["error"]
+
+
+def mcp(msgs, patient="P042"):
+    raw = "".join(m if isinstance(m, str) else json.dumps(m) + "\n" for m in msgs)
+    done = subprocess.run([sys.executable, "-m", "ahe.mcp_server", patient], cwd=ROOT,
+                          input=raw, capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    return {r["id"]: r for r in map(json.loads, done.stdout.splitlines())}
+
+
+def call(i, name, args):
+    return {"jsonrpc": "2.0", "id": i, "method": "tools/call",
+            "params": {"name": name, "arguments": args}}
 
 
 def test_mcp_calls_go_through_the_same_gate():
-    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-             "params": {"name": "search_notes", "arguments": {"terms": ["apixaban"], "page": 1}}},
-            {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
-             "params": {"name": "submit_packet", "arguments": {}}},
-            {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
-             "params": {"name": "search_notes", "arguments": {"terms": "apixaban", "page": 1}}}]
-    out = subprocess.run([sys.executable, "-m", "ahe.mcp_server", "P042"], cwd=ROOT,
-                         input="".join(json.dumps(m) + "\n" for m in msgs),
-                         capture_output=True, text=True, timeout=30).stdout
-    replies = {r["id"]: r["result"] for r in map(json.loads, out.splitlines())}
-    names = [t["name"] for t in replies[2]["tools"]]
+    replies = mcp([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                   {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                   call(3, "search_notes", {"terms": ["apixaban"], "page": 1}),
+                   call(4, "submit_packet", {}),
+                   call(5, "search_notes", {"terms": "apixaban", "page": 1})])
+    names = [t["name"] for t in replies[2]["result"]["tools"]]
     assert "submit_packet" not in names and "search_notes" in names
-    assert json.loads(replies[3]["content"][0]["text"])["notes"] == ["n58"]
-    assert replies[4]["isError"] and "no tool" in replies[4]["content"][0]["text"] or \
-        "may not submit" in replies[4]["content"][0]["text"]
-    assert replies[5]["isError"] and "bad terms" in replies[5]["content"][0]["text"]
+    assert json.loads(replies[3]["result"]["content"][0]["text"])["notes"] == ["n58"]
+    assert replies[4]["result"]["isError"] is True
+    assert "no tool" in replies[4]["result"]["content"][0]["text"]
+    assert replies[5]["result"]["isError"] is True
+    assert "bad terms" in replies[5]["result"]["content"][0]["text"]
+
+
+def test_mcp_survives_malformed_messages_and_failing_tools():
+    replies = mcp(["{not json\n",
+                   call(2, "finish", {}),
+                   call(3, "read_note", {"note_id": "n58"}),            # never searched
+                   call(4, "search_notes", {"terms": ["apixaban"], "page": 1}),
+                   call(5, "read_note", {"note_id": "n58"})])
+    assert replies[None]["error"]["code"] == -32700
+    assert replies[2]["result"]["isError"] and "no tool" in replies[2]["result"]["content"][0]["text"]
+    assert replies[3]["result"]["isError"] and "bad note_id" in replies[3]["result"]["content"][0]["text"]
+    assert replies[5]["result"]["isError"] is False
+
+
+def test_no_dispatch_after_the_run_ends_or_the_budget_is_spent():
+    backend = Submissions()
+    h = Harness(COORDINATOR, backend)
+    run = h.run(P042, planner_v5)
+    assert h.dispatch(run, {"tool": "submit_packet", "args": {}})["error"] == "run is over"
+    fresh = start(P042, ch05.Budget(steps=0))
+    assert h.dispatch(fresh, {"tool": "evaluate_rule", "args": {"rule_id": "age"}})["error"] == "no steps left"
+    assert backend.calls == 1
+
+
+def test_only_ids_a_search_returned_can_be_read():
+    h = Harness(COORDINATOR, Submissions())
+    run = start(request("P041", 3))
+    assert h.admit(run, {"tool": "read_note", "args": {"note_id": "n25"}})
+    h.dispatch(run, {"tool": "search_notes", "args": {"terms": ["physiotherapy", "review", "routine", "dental"], "page": 1}})
+    assert len(run.hits) == ch05.PAGE
+    assert h.admit(run, {"tool": "read_note", "args": {"note_id": sorted(run.hits)[0]}}) is None
+
+
+def test_the_stored_packet_cannot_change_after_the_receipt():
+    backend = Submissions()
+    run = Harness(COORDINATOR, backend).run(P042, planner_v5)
+    stored = next(iter(backend.stored.values()))[1]
+    run.draft["patient"] = "P999"
+    assert json.loads(next(iter(backend.stored.values()))[1])["patient"] == "P042" and stored
+
+
+def test_the_same_request_run_twice_stores_one_packet():
+    backend = Submissions()
+    h = Harness(COORDINATOR, backend)
+    a, b = h.run(P042, planner_v5), h.run(P042, planner_v5)
+    assert a.receipt == b.receipt and len(backend.stored) == 1
+
+
+def test_hostile_arguments_get_bounded_refusals():
+    run = start(P042)
+    tool = ch05.SEARCH
+    assert check_args(run, tool, {"terms": ["x"], 1: 2})["error"].startswith("search_notes got")
+    long = check_args(run, tool, {"terms": "x" * 10_000, "page": 1})
+    assert len(long["error"]) < 100
+
+
+def test_unassigned_reviewer_is_refused_before_version_lookup():
+    for version in (3, 999):
+        out = Harness(OUTSIDER, Submissions()).run(request("P042", version), planner_v5)
+        assert out == {"status": "refused", "reason": "reviewer-b not on T004"}
+
+
+def test_finish_needs_a_current_draft():
+    h = Harness(COORDINATOR, Submissions())
+    run = h.run(P042, planner_v5)
+    fresh = start(P042)
+    for rule in ("age", "marker", "no_anticoag"):
+        h.dispatch(fresh, {"tool": "evaluate_rule", "args": {"rule_id": rule}})
+    out = h.dispatch(fresh, {"tool": "finish"})
+    assert out["error"] == "cannot finish" and "not current" in out["why"] or "draft" in out["why"]
+    assert fresh.state == "running"

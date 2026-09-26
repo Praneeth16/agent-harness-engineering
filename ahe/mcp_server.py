@@ -46,15 +46,18 @@ class Server:
             return {"tools": [{"name": t.name, "description": t.doc,
                                "inputSchema": schema(t)} for t in tools]}
         if method == "tools/call":
-            proposal = {"tool": params.get("name"), "args": params.get("arguments", {})}
-            self.run.record("proposal", proposal=proposal)
-            problem = self.harness.admit(self.run, proposal)
-            if problem:
-                self.run.record("gate", refused=problem)
-                return {"content": [{"type": "text", "text": json.dumps(problem)}],
-                        "isError": True}
-            out = self.harness.tools[proposal["tool"]].fn(self.run, **proposal["args"])
-            self.run.record("observation", tool=proposal["tool"], **out)
+            name = params.get("name")
+            if name not in self.harness.visible(self.run):   # finish is not a tool
+                problem = ch05.refuse(f"no tool {ch05.preview(name)}",
+                                      f"tools: {self.harness.visible(self.run)}",
+                                      "use one of the listed tools")
+                return {"content": [{"type": "text", "text": json.dumps(problem)}], "isError": True}
+            proposal = {"tool": name, "args": params.get("arguments", {})}
+            try:
+                out = self.harness.dispatch(self.run, proposal)
+            except Exception as why:            # a tool failed: report it, keep serving
+                out = {"error": f"{type(why).__name__}: {why}"}
+                self.run.record("observation", **out)
             return {"content": [{"type": "text", "text": json.dumps(out, default=str)}],
                     "isError": "error" in out}
         raise KeyError(method)
@@ -63,14 +66,22 @@ class Server:
         for line in lines:
             if not line.strip():
                 continue
-            msg = json.loads(line)
-            if "id" not in msg:          # a notification needs no reply
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                write(json.dumps({"jsonrpc": "2.0", "id": None,
+                                  "error": {"code": -32700, "message": "parse error"}}) + "\n")
+                continue
+            if not isinstance(msg, dict) or "id" not in msg:   # notifications need no reply
                 continue
             try:
                 reply = {"jsonrpc": "2.0", "id": msg["id"], "result": self.handle(msg)}
             except KeyError as why:
                 reply = {"jsonrpc": "2.0", "id": msg["id"],
                          "error": {"code": -32601, "message": f"no method {why}"}}
+            except Exception as why:
+                reply = {"jsonrpc": "2.0", "id": msg["id"],
+                         "error": {"code": -32603, "message": f"{type(why).__name__}"}}
             write(json.dumps(reply) + "\n")
 
 

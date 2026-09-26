@@ -23,9 +23,11 @@ ENV_FILE = Path.home() / ".config" / "ahe" / "openrouter.env"
 def load_env():
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text().splitlines():
+            line = line.split("#", 1)[0].strip()      # drop comments
             key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
             if key and value and key not in os.environ:
-                os.environ[key.strip()] = value.strip()
+                os.environ[key] = value
     return os.environ.get("AHE_LIVE") == "1" and "AHE_API_KEY" in os.environ
 
 

@@ -4,9 +4,9 @@ import hashlib
 import json
 
 from .ch04 import *            # noqa: F401,F403
-from .ch04 import (Budget, BudgetExhausted, RECORDS, Run, assemble,
-                   deepcopy, fake_reader, notes_of, select_protocol,
-                   unfinished, words, RUN_IDS)
+from .ch04 import (Budget, BudgetExhausted, ContractError, RECORDS, Run,
+                   assemble, deepcopy, fake_reader, notes_of,
+                   select_protocol, unfinished, words, RUN_IDS)
 from .ch03 import t_read, t_evaluate
 
 # listing 5.1
@@ -38,8 +38,10 @@ def check_args(run, tool, args):
                       "each tool takes named arguments",
                       "send args as a JSON object")
     names = sorted(p.name for p in tool.params)
-    if sorted(args) != names:
-        return refuse(f"{tool.name} got {sorted(args)}",
+    given = sorted(map(str, args))
+    if given != names or not all(type(k) is str
+                                 for k in args):
+        return refuse(f"{tool.name} got {given}",
                       f"it takes exactly {names}",
                       f"send {names} and nothing else")
     for p in tool.params:
@@ -50,9 +52,16 @@ def check_args(run, tool, args):
         except Exception:
             ok = False
         if not ok:
-            return refuse(f"bad {p.name}: {v!r}", p.doc,
-                          p.fix)
+            return refuse(f"bad {p.name}: {preview(v)}",
+                          p.doc, p.fix)
     return None
+
+def preview(v, n=60):       # bounded, and safe to print
+    try:
+        text = json.dumps(v, default=str)
+    except Exception:
+        text = "<unprintable>"
+    return text if len(text) <= n else text[:n] + "..."
 # end listing
 
 PAGE = 3                       # search results per page
@@ -63,18 +72,19 @@ def search(run, terms, page):
     low = [t.lower() for t in terms]
     hits = [n.id for n in notes_of(run)
             if any(w in n.text.lower() for w in low)]
-    if set(hits) - run.hits:
+    start = (page - 1) * PAGE
+    shown = hits[start:start + PAGE]
+    if set(shown) - run.hits:
         run.version += 1
         run.changed["anticoagulant"] = run.version
-    run.hits.update(hits)
-    start = (page - 1) * PAGE
-    return {"notes": hits[start:start + PAGE],
-            "page": page, "more": len(hits) > start + PAGE}
+    run.hits.update(shown)       # only ids the planner saw
+    return {"notes": shown, "page": page,
+            "more": len(hits) > start + PAGE}
 
 def in_run(ids):
     return lambda run, v: v in ids(run)
 
-NOTE_IDS = lambda run: {n.id for n in notes_of(run)}
+NOTE_IDS = lambda run: run.hits   # returned by a search
 RULE_IDS = lambda run: {r.id for r in run.protocol.rules}
 
 SEARCH = Tool("search_notes", "read",
@@ -123,11 +133,11 @@ class Submissions:
     def __init__(self):
         self.stored, self.calls = {}, 0
 
-    def submit(self, key, packet):
-        self.calls += 1
+    def submit(self, key, text):
+        self.calls += 1       # text: the serialized packet
         if key not in self.stored:
             receipt = f"S{len(self.stored) + 1:04d}"
-            self.stored[key] = (receipt, packet)
+            self.stored[key] = (receipt, text)
         return self.stored[key][0]
 
 def digest(packet):
@@ -156,8 +166,12 @@ def submit(run, backend):
         return refuse("draft is stale",
                       "evidence changed after drafting",
                       "call draft_packet again")
-    key = f"{run.id}:{digest(run.draft)}"   # harness-made
-    run.receipt = backend.submit(key, run.draft)
+    text = json.dumps(run.draft, sort_keys=True,
+                      default=str)
+    r = run.request      # one key per request and packet
+    key = (f"{r['patient']}:{r['study']}:{r['version']}:"
+           f"{r['on']}:{digest(run.draft)}")
+    run.receipt = backend.submit(key, text)
     return {"submitted": run.receipt}
 # end listing
 
@@ -183,10 +197,10 @@ def authorize(principal, tool, run):
                       "leave the draft for a coordinator")
     return None
 
-def audit(log):
-    def hook(run, tool, args, principal):
+def audit(log):          # an after hook: calls that ran
+    def hook(run, tool, args, principal, result):
         log.append((run.id, principal.name, tool.name,
-                    json.dumps(args, sort_keys=True)))
+                    "error" not in result))
     return hook
 # end listing
 
@@ -198,8 +212,10 @@ class Harness:
     backend: Submissions
     reader: object = fake_reader
     before: tuple = ()
+    after: tuple = ()            # (run, tool, args, principal, result)
     limit: int = 2400
     teach: bool = True           # False: refusals say only "refused"
+    skill: object = None         # narrows the visible tools
 
     def __post_init__(self):
         self.tools = {t.name: t for t in (
@@ -222,15 +238,22 @@ class Harness:
     def step(self, run, planner):
         return step(self, run, planner)
 
+    def dispatch(self, run, proposal):
+        return dispatch(self, run, proposal)
+
     def run(self, req, planner, budget=None):
         return run_harness(self, req, planner, budget)
 
 
 # listing 5.5
 def visible(h, run):
-    # The planner is shown only the tools it may call.
-    return sorted(n for n, t in h.tools.items()
-                  if not authorize(h.principal, t, run))
+    # The planner is shown only the tools it may call, and
+    # a skill can narrow that list but never widen it.
+    names = {n for n, t in h.tools.items()
+             if not authorize(h.principal, t, run)}
+    if h.skill is not None:
+        names &= h.skill.wants
+    return sorted(names)
 
 def admit(h, run, proposal):
     if not isinstance(proposal, dict):
@@ -242,8 +265,12 @@ def admit(h, run, proposal):
     if name == "finish":
         return None
     if type(name) is not str or name not in h.tools:
-        return refuse(f"no tool {name!r}",
-                      f"tools: {sorted(h.tools)}",
+        return refuse(f"no tool {preview(name)}",
+                      f"tools: {visible(h, run)}",
+                      "use one of the listed tools")
+    if h.skill is not None and name not in h.skill.wants:
+        return refuse(f"{name} is outside the skill",
+                      f"skill tools: {visible(h, run)}",
                       "use one of the listed tools")
     tool, args = h.tools[name], proposal.get("args", {})
     problem = (authorize(h.principal, tool, run)
@@ -259,7 +286,16 @@ def admit(h, run, proposal):
 def step(h, run, planner):
     ctx = deepcopy(assemble(run, limit=h.limit))
     ctx["tools"] = visible(h, run)
-    proposal = planner(ctx)
+    dispatch(h, run, deepcopy(planner(ctx)))
+
+def dispatch(h, run, proposal):
+    # The one path to a tool, for the loop and for MCP.
+    if run.state != "running":
+        return refuse("run is over", f"it is {run.state}",
+                      "start a new run")
+    if run.count("proposal") >= run.budget.steps:
+        return refuse("no steps left", "budget spent",
+                      "start a run with a larger budget")
     if isinstance(proposal, dict):
         proposal = {k: proposal[k] for k in ("tool", "args")
                     if k in proposal}
@@ -269,40 +305,51 @@ def step(h, run, planner):
         run.record("gate", refused=problem)
         seen = problem if h.teach else {"error": "refused"}
         run.record("observation", **seen)
-        return
+        return seen
     name = proposal["tool"]
     if name == "finish":
         return finish(run)
-    out = h.tools[name].fn(run, **proposal.get("args", {}))
+    tool, args = h.tools[name], proposal.get("args", {})
+    out = tool.fn(run, **args)
     run.record("observation", tool=name, **out)
+    for hook in h.after:
+        hook(run, tool, args, h.principal, out)
+    return out
 
 def finish(run):
     todo = unfinished(run)
     if todo:
-        return run.record("observation", **refuse(
-            "cannot finish", f"not current: {todo}",
-            "evaluate those rules, then finish"))
-    if getattr(run, "draft_version", None) != run.version:
-        return run.record("observation", **refuse(
-            "cannot finish", "no current draft",
-            "call draft_packet, then finish"))
-    run.state = "completed"
-    run.reason = "packet drafted from current results"
-    run.record("observation", tool="finish", accepted=True)
+        out = refuse("cannot finish",
+                     f"not current: {todo}",
+                     "evaluate those rules, then finish")
+    elif getattr(run, "draft_version", None) != run.version:
+        out = refuse("cannot finish", "no current draft",
+                     "call draft_packet, then finish")
+    else:
+        out = {"tool": "finish", "accepted": True}
+        run.state = "completed"
+        run.reason = "packet drafted from current results"
+    run.record("observation", **out)
+    return out
 # end listing
 
 
 # listing 5.7
 def run_harness(h, req, planner, budget=None):
-    req = deepcopy(req)
-    protocol = select_protocol(req["study"], req["version"],
-                               req["on"])
+    req, p = deepcopy(req), h.principal
+    study = req.get("study")
+    if study not in p.studies:             # before lookups
+        return {"status": "refused",
+                "reason": f"{p.name} not on {study}"}
+    try:
+        protocol = select_protocol(
+            study, req["version"], req["on"])
+    except ContractError as why:
+        return {"status": "refused", "reason": str(why)}
+    if req["patient"] not in RECORDS:
+        return {"status": "refused", "reason": "no record"}
     run = Run(f"run-{next(RUN_IDS)}-{req['patient']}",
               req, protocol, budget or Budget())
-    problem = authorize(h.principal, SEARCH, run)
-    if problem or req["patient"] not in RECORDS:
-        why = problem["error"] if problem else "no record"
-        return {"status": "refused", "reason": why}
     run.evidence = list(RECORDS[req["patient"]])
     run.record("request", patient=req["patient"],
                protocol=protocol.version,
@@ -345,10 +392,11 @@ def load_skill(path):
     return Skill(meta["name"], meta["description"],
                  frozenset(wants), body.strip())
 
-def with_skill(h, run, skill):
-    # A skill may narrow the tools a planner sees. It
-    # cannot add one the principal may not use.
-    return sorted(set(visible(h, run)) & skill.wants)
+def with_skill(h, skill):
+    # The same harness, narrowed to what the skill asks
+    # for; visible() still drops what the principal lacks.
+    from dataclasses import replace
+    return replace(h, skill=skill)
 # end listing
 
 

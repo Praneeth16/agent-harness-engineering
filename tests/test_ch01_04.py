@@ -658,3 +658,15 @@ def test_version_is_checked_before_any_context_is_logged():
     run = ch03.run_task(request("P042", 3), ch03.fake_planner, context=ch04.context_v2)
     assert run.state == "failed" and "expects context v1" in run.reason
     assert run.count("context") == 0 and run.count("proposal") == 0
+
+
+def test_load_env_ignores_comments_and_spaces(monkeypatch, tmp_path):
+    from ahe import live
+    env = tmp_path / "x.env"
+    env.write_text("# settings\nAHE_MODEL = m1   # the model\n AHE_BASE_URL=http://u\n")
+    monkeypatch.setattr(live, "ENV_FILE", env)
+    monkeypatch.delenv("AHE_MODEL", raising=False)
+    monkeypatch.delenv("AHE_BASE_URL", raising=False)
+    live.load_env()
+    import os
+    assert os.environ["AHE_MODEL"] == "m1" and os.environ["AHE_BASE_URL"] == "http://u"
