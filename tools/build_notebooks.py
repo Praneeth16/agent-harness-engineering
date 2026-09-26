@@ -221,19 +221,26 @@ for pid in ("P041", "P043"):
 for e in run.events:
     print(e)
 print(packet(run))'''),
-        md("## 4. Replay the recorded live-planner runs (Table 3.5)\n\nThe runtime is deterministic given the planner's replies, so feeding the recorded replies back reproduces each run exactly."),
-        code('''from ahe import ch01, live
+        md("## 4. Replay the recorded live-planner runs (Table 3.5)\n\nThe runtime is deterministic given the planner's replies, so feeding the recorded replies back recomputes each run. Every call must rebuild exactly the prompt that was recorded, and every reply must be used; otherwise the cell stops. The saved Chapter 3 records hold calls, not outcomes, so this is a recomputation, checked call by call."),
+        code('''import json
+from ahe import ch01, live
 recs = live.records("ch03_planner_gpt-6-luna")
-replies = iter(r["reply"] for r in recs)
+calls = iter(recs)
 def replay(context):
+    rec = next(calls)                       # StopIteration: a reply is missing
+    if ch03.PLANNER_PROMPT + json.dumps(context, default=str) != rec["prompt"]:
+        raise RuntimeError("prompt differs from the record")
     try:
-        return ch01.parse_json(next(replies))
+        return ch01.parse_json(rec["reply"])
     except ValueError:
         return {"tool": None}
 for pid in ["P041"] * 5 + ["P043"] * 5:
     r = run_task(request(pid, 3), replay)
+    if r.state == "failed":
+        raise RuntimeError(r.reason)
     print(pid, r.state, r.count("proposal"), "steps,", r.reads, "reads,",
-          r.results.get("no_anticoag", ("-",))[0])'''),
+          r.results.get("no_anticoag", ("-",))[0])
+assert next(calls, None) is None, "recorded replies left over"'''),
         md(LIVE_NOTE),
         code('''if LIVE:
     live.load_env()
@@ -245,23 +252,54 @@ for pid in ["P041"] * 5 + ["P043"] * 5:
     print(r.state, r.reason)
 else:
     print("Set AHE_LIVE=1 to run the live planner.")'''),
-        md("## Exercise solutions\n\n### Exercise 3.1\n\nA rule: when the step budget is spent and `unfinished(run)` is empty, complete the run with the reason \"budget spent; every rule current\". It is wrong when finishing is itself a decision the planner owes, for example when a later chapter requires a drafted packet or an approval before completion."),
+        md("## Exercise solutions\n\n### Exercise 3.1\n\nA rule: when the step budget is spent and `unfinished(run)` is empty, end the run as completed with the reason \"budget spent; every rule current\". The decision has to be made before the stop is recorded, so the loop below is Chapter 3's `drive` with that one branch changed. It is wrong when finishing is itself a decision the planner owes, for example when a later chapter requires a drafted packet or an approval before completion."),
         code('''def drive_autofinish(run, planner, reader=ch03.fake_reader):
-    run = ch03.drive(run, planner, reader)
-    if run.state == "blocked" and run.reason == "step budget spent" and not ch03.unfinished(run):
-        run.state, run.reason = "completed", "budget spent; every rule current"
-        run.record("stop", state=run.state, reason=run.reason)
-    return run'''),
-        md("### Exercise 3.2\n\nThe gate needs `draft_packet` in `SPEC` with no arguments. The completion check then also requires that a draft exists and that it was drafted after the last change to any rule's evidence."),
+    while run.state == "running":
+        if run.count("proposal") >= run.budget.steps:
+            if ch03.unfinished(run):
+                ch03.end(run, "blocked", "step budget spent")
+            else:
+                ch03.end(run, "completed", "budget spent; every rule current")
+        else:
+            try:
+                ch03.step(run, planner, reader)
+            except ch03.BudgetExhausted as why:
+                run.record("observation", error=str(why))
+                ch03.end(run, "blocked", str(why))
+    return run
+
+def never_finishes(context):       # does the work, never asks to finish
+    p = ch03.fake_planner(context)
+    return p if p["tool"] != "finish" else {"tool": "search_notes", "args": {"terms": ["zzzz"]}}
+r = drive_autofinish(ch03.start(request("P041", 3), ch03.Budget(steps=9)), never_finishes)
+print(r.state, r.reason, "| stops:", r.count("stop"))'''),
+        md("### Exercise 3.2\n\nThe gate needs `draft_packet` in the run's registry with no arguments, and the completion check must now also require a draft made after the last change to the evidence. The planner below drafts before it asks to finish."),
         code('''def t_draft(run):
-    run.draft = packet(run)
-    run.draft_seq = len(run.events)
+    run.draft, run.draft_version = packet(run), run.version
     return {"drafted": sorted(run.draft["criteria"])}
-ch03.TOOLS["draft_packet"] = t_draft
-ch03.SPEC["draft_packet"] = {}
-print(ch03.gate(ch03.start(request("P041", 3)), {"tool": "draft_packet", "args": {}}))
-del ch03.TOOLS["draft_packet"], ch03.SPEC["draft_packet"]'''),
-        md("### Exercise 3.3\n\nRead the proposals the replay prints in section 4. Letting the model choose search terms unwatched is reasonable, because the gate bounds them and `ground` checks what they find. Stopping early is the choice to fixture first: 2 of the 10 recorded runs spent their budget with every rule current."),
+registry = ch03.Registry({**ch03.TOOLS, "draft_packet": t_draft},
+                         {**ch03.SPEC, "draft_packet": {}})
+
+def drafting_planner(context):
+    p = ch03.fake_planner(context)
+    drafted = any("drafted" in e for e in context["observations"])
+    if p["tool"] == "finish" and not drafted:
+        return {"tool": "draft_packet", "args": {}}
+    return p
+
+def step_needing_a_draft(run, planner, reader=ch03.fake_reader):
+    if planner(ch03.context_for(run))["tool"] == "finish" and \\
+            getattr(run, "draft_version", None) != run.version:
+        run.record("proposal", proposal={"tool": "finish"})
+        run.record("observation", error="cannot finish: no current draft")
+        return
+    ch03.step(run, planner, reader)
+
+run = ch03.start(request("P041", 3), registry=registry)
+while run.state == "running" and run.count("proposal") < 14:
+    step_needing_a_draft(run, drafting_planner)
+print(run.state, [e.get("tool") for e in run.events if e["kind"] == "observation"][-3:])'''),
+        md("### Exercise 3.3\n\nRead the proposals the replay prints in section 4. The gate bounds the search terms and `ground` checks what the reads find, but neither measures recall: a planner that searches for the wrong words, reads nothing, and evaluates gets `unknown` without any check failing. Before letting a model choose search terms unwatched, write fixtures that name the notes each search must find, including a brand name and a drug outside the term list. The harness already refuses to conclude absence from a search alone: `met` for the note rule needs every note in scope read."),
     ])
 
 

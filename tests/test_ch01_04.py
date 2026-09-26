@@ -446,7 +446,7 @@ def test_build_writes_no_events():
 
 
 def test_inspect_log_is_bounded():
-    run = ch03.start(request("P042", 3))
+    run = ch03.start(request("P042", 3), registry=ch04.REGISTRY4)
     assert ch03.gate(run, {"tool": "inspect_log",
                            "args": {"kind": "observation", "last": 0}})
     assert ch03.gate(run, {"tool": "inspect_log",
@@ -504,8 +504,11 @@ def test_planner_cannot_change_the_logged_bundle():
                                   {"kind": "observation", "last": True},
                                   {"kind": [], "last": 1}])
 def test_inspect_log_refuses_malformed_values(args):
-    run = ch03.start(request("P042", 3))
+    run = ch03.start(request("P042", 3), registry=ch04.REGISTRY4)
+    assert ch03.gate(run, {"tool": "inspect_log", "args": {"kind": "observation", "last": 1}}) is None
     assert ch03.gate(run, {"tool": "inspect_log", "args": args})
+    assert ch03.gate(ch03.start(request("P042", 3)),
+                     {"tool": "inspect_log", "args": {"kind": "observation", "last": 1}})  # not in Chapter 3
 
 
 def test_proposals_are_stored_without_extra_fields():
@@ -530,3 +533,77 @@ def test_printed_listings_fit_the_page():
         for number, body in LISTING.findall(path.read_text()):
             for line in body.splitlines():
                 assert len(line) <= 60, (path.name, number, line)
+
+
+# ---------------------------------------------------------------- Chapter 3, round 2
+
+def test_search_cannot_prove_absence():
+    # P052: an absence note, then a rivaroxaban note the listed terms miss.
+    req = request("P052", 3)
+    assert ch02.prepare(req)["criteria"]["no_anticoag"].status == "not met"
+    for run in (ch03.fixed_screen(req), ch03.run_task(req, ch03.fake_planner)):
+        r = run.results["no_anticoag"]
+        assert r.status != "met", r
+
+
+def test_failed_read_does_not_leave_a_result_current():
+    run = ch03.start(request("P052", 3))
+    ch03.t_read(run, "n11", ch03.fake_reader)
+    ch03.t_evaluate(run, "no_anticoag")
+    with pytest.raises(RuntimeError):
+        ch03.t_read(run, "n12", ch03.broken_reader)
+    assert "n12" not in run.seen
+    assert "no_anticoag" in ch03.unfinished(run)
+
+
+def test_a_finished_run_cannot_be_stepped():
+    run = ch03.run_task(P041, ch03.fake_planner)
+    with pytest.raises(ch02.ContractError):
+        ch03.step(run, lambda c: {"tool": "search_notes", "args": {"terms": ["marker"]}},
+                  ch03.fake_reader)
+    assert run.events[-1]["kind"] == "stop" and run.count("stop") == 1
+
+
+def test_read_budget_block_writes_an_observation():
+    run = ch03.run_task(P041, ch03.fake_planner, budget=ch03.Budget(reads=1))
+    assert run.state == "blocked" and run.count("proposal") == run.count("observation")
+
+
+def test_planner_cannot_rewrite_an_earlier_proposal():
+    kept = {}
+    def sneaky(context):
+        if "p" in kept:
+            kept["p"]["args"]["terms"][0] = "warfarin"
+            return {"tool": "finish"}
+        kept["p"] = {"tool": "search_notes", "args": {"terms": ["apixaban"]}}
+        return kept["p"]
+    run = ch03.start(P041)
+    ch03.step(run, sneaky, ch03.fake_reader)
+    ch03.step(run, sneaky, ch03.fake_reader)
+    assert run.events[1]["proposal"]["args"]["terms"] == ["apixaban"]
+
+
+def test_unprintable_values_are_refused_not_raised():
+    class Nasty:
+        def __hash__(self): raise RuntimeError("hash exploded")
+        def __repr__(self): raise RuntimeError("repr exploded")
+    run = ch03.start(P041)
+    ch03.step(run, lambda c: {"tool": "read_note", "args": {"note_id": Nasty()}}, ch03.fake_reader)
+    assert run.state == "running" and run.events[-2]["kind"] == "gate"
+
+
+@pytest.mark.parametrize("budget", [ch03.Budget(steps=float("nan")), ch03.Budget(reads=-1),
+                                    ch03.Budget(steps=2.5)])
+def test_budgets_must_be_whole_numbers(budget):
+    assert ch03.run_task(P041, ch03.fake_planner, budget=budget)["status"] == "refused"
+
+
+def test_chapter_4_does_not_change_chapter_3s_tools():
+    assert "inspect_log" not in ch03.TOOLS and "inspect_log" not in ch03.SPEC
+    assert "inspect_log" in ch04.REGISTRY4.tools
+
+
+def test_chapter_3_keeps_a_real_quote_for_the_reviewer():
+    run = ch03.run_task(request("P036", 3), ch03.fake_planner, reader=ch02.doubter)
+    r = run.results["no_anticoag"]
+    assert r.status == "unknown" and r.quote == "Started warfarin 5 mg daily on 2026-07-02"

@@ -6,7 +6,7 @@ from .ch03 import *            # noqa: F401,F403
 from .ch03 import (D, NOTES, PROTOCOLS, RECORDS, SEARCH_TERMS, SPEC,
                    TOOLS, BudgetExhausted, Evidence, Note, Budget,
                    request, run_task, start, drive, unfinished, words,
-                   context_for)
+                   context_for, Registry)
 
 # listing 4.1
 import hashlib, json
@@ -94,11 +94,15 @@ def t_inspect(run, kind, last):
     return {"events": [{k: v for k, v in e.items()
                         if k not in ("kind", "bundle")}
                        for e in picked[-last:]]}
-TOOLS["inspect_log"] = t_inspect
 KINDS = {"proposal", "gate", "observation", "context"}
-SPEC["inspect_log"] = {
-    "kind": lambda run, v: type(v) is str and v in KINDS,
-    "last": lambda run, v: type(v) is int and 1 <= v <= 5}
+def kind_ok(run, v):
+    return type(v) is str and v in KINDS
+def last_ok(run, v):
+    return type(v) is int and 1 <= v <= 5
+REGISTRY4 = Registry(   # Chapter 3's tools plus this one
+    {**TOOLS, "inspect_log": t_inspect},
+    {**SPEC, "inspect_log": {"kind": kind_ok,
+                             "last": last_ok}})
 
 def planner_v2(context):         # reads context v2
     # Works from the derived pending block, not the history.
@@ -219,10 +223,15 @@ NOTES["P044"] = [
 ]
 
 
+def run_task4(req, planner, **kw):
+    """Chapter 4's runs: the assembled context and the Chapter 4 registry."""
+    kw.setdefault("context", context_v2)
+    return run_task(req, planner, registry=REGISTRY4, **kw)
+
+
 def table_4_3():
-    run = run_task(request("P042", 3), planner_v2, context=context_v2)
-    mid = run_task(request("P042", 3), planner_v2, context=context_v2,
-                   budget=Budget(steps=3))
+    run = run_task4(request("P042", 3), planner_v2)
+    mid = run_task4(request("P042", 3), planner_v2, budget=Budget(steps=3))
     return run, mid
 
 
