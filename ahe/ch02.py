@@ -175,21 +175,26 @@ def ground(p, note, field, on):
                 else "no statement in note")
     if len(said) > 1:
         return "several statements; needs review"
-    quote = p.get("quote")
-    whole = sentences(note.text)
-    if type(quote) is not str or (
-            quote.strip().rstrip(".") not in whole):
+    q = p.get("quote")
+    q = q.strip().rstrip(".") if type(q) is str else ""
+    if q not in sentences(note.text):
         return "quotation is not a sentence of the note"
+    if q not in said:          # it must be about the field
+        return "quotation is not about the field"
     if status == "unclear":
         return "statement unclear; needs review"
-    no = quote.strip().lower().startswith(NEGATIONS)
-    if no != (status == "absent"):
-        return f"quotation does not say {status}"
+    low = f" {q.lower()} "
+    if status == "absent" and not low[1:].startswith(
+            NEGATIONS):
+        return "quotation does not say absent"
+    if status == "present" and any(
+            f" {n}" in low for n in NEGATIONS):
+        return "direction unclear; needs review"
     when = p.get("observed")
     if type(when) is not str or not re.fullmatch(
             r"\d{4}-\d{2}-\d{2}", when):
         return "statement has no date"
-    if when not in quote:
+    if when not in q:
         return "date is not in the quotation"
     try:
         day = date.fromisoformat(when)

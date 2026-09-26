@@ -223,24 +223,14 @@ for e in run.events:
 print(packet(run))'''),
         md("## 4. Replay the recorded live-planner runs (Table 3.5)\n\nThe runtime is deterministic given the planner's replies, so feeding the recorded replies back recomputes each run. Every call must rebuild exactly the prompt that was recorded, and every reply must be used; otherwise the cell stops. The saved Chapter 3 records hold calls, not outcomes, so this is a recomputation, checked call by call."),
         code('''import json
-from ahe import ch01, live
-recs = live.records("ch03_planner_gpt-6-luna")
-calls = iter(recs)
-def replay(context):
-    rec = next(calls)                       # StopIteration: a reply is missing
-    if ch03.PLANNER_PROMPT + json.dumps(context, default=str) != rec["prompt"]:
-        raise RuntimeError("prompt differs from the record")
-    try:
-        return ch01.parse_json(rec["reply"])
-    except ValueError:
-        return {"tool": None}
-for pid in ["P041"] * 5 + ["P043"] * 5:
-    r = run_task(request(pid, 3), replay)
-    if r.state == "failed":
-        raise RuntimeError(r.reason)
+from ahe import live
+trials = ["P041"] * 5 + ["P043"] * 5
+runs, _ = live.replay("ch03_planner_gpt-6-luna", trials,
+                      lambda c: ch03.PLANNER_PROMPT + json.dumps(c, default=str),
+                      lambda planner, pid: run_task(request(pid, 3), planner))
+for pid, r in zip(trials, runs):
     print(pid, r.state, r.count("proposal"), "steps,", r.reads, "reads,",
-          r.results.get("no_anticoag", ("-",))[0])
-assert next(calls, None) is None, "recorded replies left over"'''),
+          r.results.get("no_anticoag", ("-",))[0])'''),
         md(LIVE_NOTE),
         code('''if LIVE:
     live.load_env()
@@ -321,23 +311,23 @@ ctx = [e for e in run.events if e["kind"] == "context"][3]
 print(ctx["sha"], ctx["chars"], "chars")
 pprint(ctx["bundle"]["pending"])'''),
         md("## 3. Replay the four-context experiment (Table 4.4)"),
-        code('''from ahe import ch01, live
-def replay(experiment, pid, context, n=5):
-    replies = iter(r["reply"] for r in live.records(experiment))
-    def planner(c):
-        try:
-            return ch01.parse_json(next(replies))
-        except ValueError:
-            return {"tool": None}
-    return [run_task(request(pid, 3), planner, budget=Budget(steps=16, reads=6), context=context)
-            for _ in range(n)]
+        code('''import json
+from ahe import live
+arms = (("naive", ch03.context_for), ("assembled", ch04.context_without_terms),
+        ("terms", ch04.context_v2), ("historyterms", ch04.context_history_with_terms),
+        ("allobs", ch04.context_all_observations))
 for pid in ("P042", "P043"):
-    for tag, context in (("naive", ch03.context_for), ("assembled", ch04.context_without_terms),
-                         ("terms", ch04.context_v2),
-                         ("historyterms", ch04.context_history_with_terms)):
-        runs = replay(f"ch04_{pid.lower()}_{tag}_gpt-6-luna", pid, context)
+    for tag, context in arms:
+        exp = f"ch04_{pid.lower()}_{tag}_gpt-6-luna"
+        if not live.records(exp):
+            continue
+        runs, _ = live.replay(exp, [pid] * 5,
+                              lambda c: ch03.PLANNER_PROMPT + json.dumps(c, default=str),
+                              lambda planner, p, context=context: run_task(
+                                  request(p, 3), planner, budget=Budget(steps=16, reads=6),
+                                  context=context))
         done = sum(r.state == "completed" for r in runs)
-        print(pid, f"{tag:10s} completed {done}/5, steps", [r.count("proposal") for r in runs])'''),
+        print(pid, f"{tag:13s} completed {done}/5, steps", [r.count("proposal") for r in runs])'''),
         md(LIVE_NOTE),
         code('''if LIVE:
     live.load_env()
@@ -347,15 +337,17 @@ for pid in ("P042", "P043"):
     print(r.state, r.reason, r.count("proposal"), "steps")
 else:
     print("Set AHE_LIVE=1 to run the live planner on the assembled context.")'''),
-        md("## Exercise solutions\n\n### Exercise 4.1\n\nThe run fails with a named reason, because `fake_planner` declares context version 1. An adapter can map `recent` to `observations`, but it cannot fill `observations` honestly: version 1 promised every observation, and the window holds only the last few. The adapter should say so, for example by adding the archive count, rather than pretend the list is complete."),
+        md("## Exercise solutions\n\n### Exercise 4.1\n\nThe run fails with a named reason, because `fake_planner` declares context version 1. An adapter can map `recent` to `observations`, but it cannot fill `observations` honestly once the window has dropped any: version 1 promised every observation. So the adapter below refuses as soon as the bundle is missing one, and the run fails with that reason instead of letting the planner act on a partial history."),
         code('''r = run_task(request("P042", 3), ch03.fake_planner, context=ch04.context_v2)
 print(r.state, r.reason)
 
 def as_v1(bundle):
+    missing = bundle["archive"]["observations"] - len(bundle["recent"])
+    if missing:                        # v1 promised every observation
+        raise ValueError(f"cannot adapt: {missing} observations are not in the bundle")
     return {"task": bundle["task"], "rules": [x["id"] for x in bundle["rules"]],
             "results": {k: v["status"] for k, v in bundle["results"].items()},
-            "observations": bundle["recent"], "steps_left": bundle["steps_left"],
-            "observations_omitted": bundle["archive"]["observations"] - len(bundle["recent"])}
+            "observations": bundle["recent"], "steps_left": bundle["steps_left"]}
 def adapted(context):
     return ch03.fake_planner(as_v1(context))
 adapted.context_schema = 2

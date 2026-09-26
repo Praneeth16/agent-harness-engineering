@@ -198,13 +198,13 @@ def end(run, state, reason):
 def step(run, planner, reader, context=context_for):
     if run.state != "running":
         raise ContractError(f"{run.id} already {run.state}")
-    ctx = deepcopy(context(run))   # the planner gets a copy
-    have = 2 if "pending" in ctx else 1  # v2: Chapter 4
+    have = getattr(context, "schema", 1)  # v2: Chapter 4
     want = getattr(planner, "context_schema", have)
-    if want != have:
+    if want != have:           # checked before building it
         raise ContractError(
             f"planner expects context v{want}, "
             f"harness gives v{have}")
+    ctx = deepcopy(context(run))   # the planner gets a copy
     proposal = deepcopy(planner(ctx))  # detached from it
     if isinstance(proposal, dict):  # keep only what may run
         proposal = {k: proposal[k] for k in ("tool", "args")

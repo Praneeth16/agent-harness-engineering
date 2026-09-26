@@ -413,8 +413,10 @@ def test_limit_is_a_limit_or_the_run_blocks():
 
 
 def test_over_limit_blocks_a_live_run():
-    run = ch03.run_task(request("P042", 3), ch04.planner_v2,
-                        context=lambda r: ch04.assemble(r, limit=300))
+    def tiny(r):
+        return ch04.assemble(r, limit=300)
+    tiny.schema = 2
+    run = ch03.run_task(request("P042", 3), ch04.planner_v2, context=tiny)
     assert run.state == "blocked" and "over limit" in run.reason
 
 
@@ -607,3 +609,52 @@ def test_chapter_3_keeps_a_real_quote_for_the_reviewer():
     run = ch03.run_task(request("P036", 3), ch03.fake_planner, reader=ch02.doubter)
     r = run.results["no_anticoag"]
     assert r.status == "unknown" and r.quote == "Started warfarin 5 mg daily on 2026-07-02"
+
+
+
+# ---------------------------------------------------------------- Chapter 4, round 2
+
+@pytest.mark.parametrize("mutate", [
+    lambda run: run.results.__setitem__("age", run.results["age"]._replace(reason="")),
+    lambda run: run.request.__setitem__("patient", "P043"),
+    lambda run: run.hits.clear(),
+])
+def test_exit_test_catches_each_change_to_the_required_part(mutate):
+    _, mid = ch04.table_4_3()
+    mutate(mid)
+    with pytest.raises(AssertionError):
+        ch04.exit_test(mid, ch04.P042_AFTER_3, (2400,))
+
+
+@pytest.mark.parametrize("text", [
+    "Patient reports no anticoagulant therapy on 2026-05-10",
+    "Patient is not taking warfarin since 2026-05-10",
+    "Patient denies warfarin use on 2026-05-10"])
+def test_embedded_negation_is_not_read_as_presence(text):
+    note = ch02.Note("nx", D(2026, 5, 10), text + ".")
+    p = ch02.fake_reader({"note": note.text, "field": "anticoagulant"})
+    assert ch02.ground(p, note, "anticoagulant", D(2026, 9, 1)) is not None
+
+
+def test_a_quote_about_something_else_is_refused():
+    note = ch02.Note("nx", D(2026, 8, 1), "No falls this year. Started warfarin on 2026-08-01.")
+    p = {"field": "anticoagulant", "status": "absent", "quote": "No falls this year",
+         "observed": "2026-08-01"}
+    assert "not about the field" in ch02.ground(p, note, "anticoagulant", D(2026, 9, 1))
+
+
+def test_build_and_inspect_return_copies():
+    run = ch03.start(request("P042", 3), registry=ch04.REGISTRY4)
+    ch03.t_search(run, ["apixaban"])
+    ch03.step(run, lambda c: {"tool": "search_notes", "args": {"terms": ["apixaban"]}},
+              ch03.fake_reader, context=ch04.context_v2)
+    before = repr(run.events)
+    ch04.build(run)["recent"][0]["notes"].append("forged")
+    ch04.t_inspect(run, "proposal", 1)["events"][0]["proposal"]["args"]["terms"].append("x")
+    assert repr(run.events) == before
+
+
+def test_version_is_checked_before_any_context_is_logged():
+    run = ch03.run_task(request("P042", 3), ch03.fake_planner, context=ch04.context_v2)
+    assert run.state == "failed" and "expects context v1" in run.reason
+    assert run.count("context") == 0 and run.count("proposal") == 0

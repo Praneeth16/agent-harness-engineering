@@ -137,3 +137,51 @@ def outcomes(experiment):
     if not path.exists():
         return []
     return [r["outcome"] for r in map(json.loads, path.read_text().splitlines()) if "outcome" in r]
+
+
+class ReplayMismatch(BaseException):
+    """Raised past the runtime's own exception handling, so a bad replay cannot pass as a run."""
+
+
+def replay(experiment, trials, prompt_of, run_trial):
+    """Feed recorded replies back through the runtime, one trial at a time.
+
+    trials: a list of trial descriptions, in the order they were recorded.
+    prompt_of(context) rebuilds the prompt a planner would send; it must equal the
+    recorded prompt for every call. run_trial(planner, trial) runs one trial and
+    returns its Run. A mismatch, a missing reply, a leftover reply, or a failed run
+    raises ReplayMismatch. Where the recording holds outcomes, each replayed run's
+    state and results must match them too.
+    """
+    from .ch01 import parse_json
+    recs = records(experiment)
+    calls = iter(enumerate(recs))
+
+    def planner(context):
+        try:
+            i, rec = next(calls)
+        except StopIteration:
+            raise ReplayMismatch(f"{experiment}: ran out of recorded replies") from None
+        if prompt_of(context) != rec["prompt"]:
+            raise ReplayMismatch(f"{experiment}: call {i} prompt differs from the record")
+        try:
+            return parse_json(rec["reply"])
+        except ValueError:
+            return {"tool": None}
+
+    runs = [run_trial(planner, t) for t in trials]
+    left = sum(1 for _ in calls)
+    if left:
+        raise ReplayMismatch(f"{experiment}: {left} recorded replies unused")
+    for r in runs:
+        if r.state == "failed":
+            raise ReplayMismatch(f"{experiment}: replayed run failed: {r.reason}")
+    saved = outcomes(experiment)
+    if saved:
+        if len(saved) != len(runs):
+            raise ReplayMismatch(f"{experiment}: {len(saved)} outcomes for {len(runs)} runs")
+        for want, r in zip(saved, runs):
+            got = {k: v.status for k, v in r.results.items()}
+            if (want.get("state"), want.get("results")) != (r.state, got):
+                raise ReplayMismatch(f"{experiment}: outcome differs for {want.get('trial', '?')}")
+    return runs, recs
