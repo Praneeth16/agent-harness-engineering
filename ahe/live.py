@@ -93,6 +93,10 @@ class Recorder:
             })
         return content
 
+    def outcome(self, **fields):
+        """Record how a trial ended, so a replay can be checked against it."""
+        self._write({"experiment": self.experiment, "at": _now(), "outcome": fields})
+
     def _write(self, record):
         with self.path.open("a") as f:
             f.write(json.dumps(record) + "\n")
@@ -116,4 +120,13 @@ def records(experiment, include_errors=False):
     if not path.exists():
         return []
     rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows = [r for r in rows if "outcome" not in r]
     return rows if include_errors else [r for r in rows if "error" not in r]
+
+
+def outcomes(experiment):
+    """Terminal outcomes written by the experiment driver, one per trial."""
+    path = RUNS / f"{experiment}.jsonl"
+    if not path.exists():
+        return []
+    return [r["outcome"] for r in map(json.loads, path.read_text().splitlines()) if "outcome" in r]
