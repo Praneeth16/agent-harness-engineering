@@ -404,13 +404,13 @@ r = reviewer.run(request("P042", 3), planner_v5)
 print(r.state, "visible:", reviewer.visible(r))
 print(reviewer.admit(r, {"tool": "submit_packet", "args": {}}))
 print(Harness(OUTSIDER, Submissions()).run(request("P042", 999), planner_v5))'''),
-        md("## 4. The exit test (Table 5.4)"),
+        md("## 4. The exit test (Table 5.4)\n\nEach row: the call, what came back, backend calls, reader calls, and whether the run's state changed."),
         code('''for pid in ("P042", "P043"):
     print(pid)
     for row in ch05.exit_test(request(pid, 3)):
         print("  ", row)
     print("   control:", ch05.attempt(request(pid, 3), ch05.CONTROL))'''),
-        md("## 5. The same gate over MCP (Table 5.3)"),
+        md("## 5. The same gate over MCP (the transcript in Section 5.7)"),
         code('''import json
 from ahe import mcp_server
 server = mcp_server.Server(Harness(REVIEWER_A, Submissions()), start(request("P042", 3)))
@@ -491,7 +491,7 @@ try:
         print(r.state, r.count("gate"), "refusals")
 finally:
     ch05.refuse = original'''),
-        md("### Exercise 5.3\n\nThe specification says a client SHOULD pass tool execution errors (`isError`) to the model, so it can correct itself, and MAY pass protocol errors, which a model is less likely to recover from. So the bad `terms` value should reach the model with its `fix`, and the unknown `submit_packet` is the one to show you. Here is the same exchange against the server as a separate process."),
+        md("### Exercise 5.3\n\nThe specification says a client SHOULD pass tool execution errors (`isError`) to the model, so it can correct itself, and MAY pass protocol errors, which a model is less likely to recover from. So the bad `terms` value is the one to hand back to the model with its `fix`, and the unknown `submit_packet` is the one to show a person. Here is the raw JSON-RPC exchange against the server as a separate process, with the classification a client would apply."),
         code('''import subprocess
 msgs = [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
@@ -502,7 +502,13 @@ done = subprocess.run([sys.executable, "-m", "ahe.mcp_server", "P042"], cwd=root
                       input="".join(json.dumps(m) + "\\n" for m in msgs), capture_output=True, timeout=30)
 assert done.returncode == 0, done.stderr
 for line in done.stdout.splitlines():
-    print(line[:160])'''),
+    reply = json.loads(line)
+    if "error" in reply:
+        print(reply["id"], "protocol error, show a person:", reply["error"]["message"][:80])
+    elif reply["result"].get("isError"):
+        print(reply["id"], "tool error, give the model:", reply["result"]["content"][0]["text"][:80])
+    else:
+        print(reply["id"], "ok:", str(reply["result"])[:80])'''),
     ])
 
 
