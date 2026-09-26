@@ -24,7 +24,7 @@ ENV_FILE = Path.home() / ".config" / "ahe" / "openrouter.env"
 def load_env():
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text().splitlines():
-            line = line.split("#", 1)[0].strip()      # drop comments
+            line = re.split(r"(?:^|\s)#", line, maxsplit=1)[0].strip()   # comments; # in a value stays
             key, _, value = line.partition("=")
             key, value = key.strip(), value.strip()
             if key and value and key not in os.environ:

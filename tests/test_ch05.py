@@ -1,6 +1,7 @@
 """Chapter 5's guarantees, as assertions."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -230,7 +231,7 @@ def test_finish_needs_a_current_draft():
     for rule in ("age", "marker", "no_anticoag"):
         h.dispatch(fresh, {"tool": "evaluate_rule", "args": {"rule_id": rule}})
     out = h.dispatch(fresh, {"tool": "finish"})
-    assert out["error"] == "cannot finish" and "not current" in out["why"] or "draft" in out["why"]
+    assert out["error"] == "cannot finish" and out["why"] == "no current draft"
     assert fresh.state == "running"
 
 
@@ -238,7 +239,6 @@ def test_finish_needs_a_current_draft():
 # ---------------------------------------------------------------- full-repository review
 
 def test_unlisted_drug_after_an_absence_goes_to_review(monkeypatch):
-    note = ch05.Note if hasattr(ch05, "Note") else None
     from ahe import ch02
     monkeypatch.setitem(ch02.NOTES, "P037", [ch02.Note("n02", ch02.D(2026, 8, 31),
         "No anticoagulant therapy in the past year, reviewed 2026-08-30. "
@@ -314,6 +314,16 @@ def test_finish_takes_no_arguments():
     h = Harness(COORDINATOR, Submissions())
     run = start(P042)
     assert h.admit(run, {"tool": "finish", "args": {"unexpected": 1}})["error"] == "finish got arguments"
+
+
+def test_a_hash_inside_an_env_value_is_kept(tmp_path, monkeypatch):
+    from ahe import live
+    env = tmp_path / "ahe.env"
+    env.write_text("# settings\nAHE_TEST_KEY=sk-ab#cd   # the key\n")
+    monkeypatch.setattr(live, "ENV_FILE", env)
+    monkeypatch.delenv("AHE_TEST_KEY", raising=False)
+    live.load_env()
+    assert os.environ["AHE_TEST_KEY"] == "sk-ab#cd"
 
 
 def test_nan_is_unknown_in_chapter_1_too():
