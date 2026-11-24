@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from ahe import ch01, ch02, ch03, ch04
-from ahe.ch02 import D, request
+from ahe.domains.hls import ch01, ch02, ch03, ch04
+from ahe.domains.hls.ch02 import D, request
 
 
 # ---------------------------------------------------------------- Chapter 1

@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from ahe import ch05
-from ahe.ch02 import request
-from ahe.ch03 import start
-from ahe.ch05 import (COORDINATOR, OUTSIDER, REVIEWER_A, Harness, Submissions,
+from ahe.domains.hls import ch05
+from ahe.domains.hls.ch02 import request
+from ahe.domains.hls.ch03 import start
+from ahe.domains.hls.ch05 import (COORDINATOR, OUTSIDER, REVIEWER_A, Harness, Submissions,
                       check_args, describe, planner_v5)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -138,7 +138,7 @@ def test_a_skill_cannot_grant_a_tool():
 
 def mcp(msgs, patient="P042"):
     raw = "".join(m if isinstance(m, str) else json.dumps(m) + "\n" for m in msgs)
-    done = subprocess.run([sys.executable, "-m", "ahe.mcp_server", patient], cwd=ROOT,
+    done = subprocess.run([sys.executable, "-m", "ahe.domains.hls.mcp_server", patient], cwd=ROOT,
                           input=raw, capture_output=True, text=True, timeout=30)
     assert done.returncode == 0, done.stderr
     return {r["id"]: r for r in map(json.loads, done.stdout.splitlines())}
@@ -238,7 +238,7 @@ def test_finish_needs_a_current_draft():
 # ---------------------------------------------------------------- full-repository review
 
 def test_unlisted_drug_after_an_absence_goes_to_review(monkeypatch):
-    from ahe import ch02
+    from ahe.domains.hls import ch02
     monkeypatch.setitem(ch02.NOTES, "P037", [ch02.Note("n02", ch02.D(2026, 8, 31),
         "No anticoagulant therapy in the past year, reviewed 2026-08-30. "
         "Started fondaparinux on 2026-08-31.")])
@@ -249,7 +249,7 @@ def test_unlisted_drug_after_an_absence_goes_to_review(monkeypatch):
 
 
 def test_unclassified_medication_note_blocks_a_clean_met(monkeypatch):
-    from ahe import ch02
+    from ahe.domains.hls import ch02
     monkeypatch.setitem(ch02.NOTES, "P037", ch02.NOTES["P037"] + [
         ch02.Note("n99", ch02.D(2026, 8, 31), "Started fondaparinux 2.5 mg daily on 2026-08-31.")])
     got = ch02.prepare(request("P037", 3))["criteria"]["no_anticoag"]
@@ -292,7 +292,7 @@ def test_logged_context_is_what_the_planner_got():
 @pytest.mark.parametrize("req", [{**P042, "on": "2026-09-01"}, {**P042, "version": 3.0},
                                  {k: v for k, v in P042.items() if k != "patient"}])
 def test_malformed_requests_are_refused_everywhere(req):
-    from ahe import ch02, ch03
+    from ahe.domains.hls import ch02, ch03
     assert ch02.prepare(req)["status"] == "refused"
     assert ch03.run_task(req, ch03.fake_planner)["status"] == "refused"
     assert Harness(COORDINATOR, Submissions()).run(req, planner_v5)["status"] == "refused"
@@ -304,7 +304,7 @@ def test_negative_budgets_are_refused_in_chapter_5():
 
 
 def test_fixed_program_runs_on_version_2():
-    from ahe import ch03
+    from ahe.domains.hls import ch03
     run = ch03.fixed_screen(request("P017", 2))
     assert run.state == "completed" and set(run.results) == {"age", "marker"}
 
@@ -326,7 +326,7 @@ def test_a_hash_inside_an_env_value_is_kept(tmp_path, monkeypatch):
 
 
 def test_nan_is_unknown_in_chapter_1_too():
-    from ahe import ch01
+    from ahe.domains.hls import ch01
     assert ch01.criterion(float("nan"), 3, 7) == "unknown"
 
 
@@ -379,7 +379,7 @@ def test_a_validity_check_that_raises_is_a_refusal():
 
 
 def test_a_tool_that_raises_under_mcp_is_an_error_result():
-    from ahe import mcp_server
+    from ahe.domains.hls import mcp_server
     out = []
     run = start(P042, ch05.Budget(steps=24, reads=0))
     server = mcp_server.Server(Harness(REVIEWER_A, Submissions()), run)
@@ -477,7 +477,7 @@ def test_a_draft_needs_every_rule_current():
 
 
 def test_skill_instructions_reach_the_live_planner(monkeypatch):
-    from ahe import ch01
+    from ahe.domains.hls import ch01
     seen = []
     monkeypatch.setattr(ch01, "chat", lambda prompt: seen.append(prompt) or '{"tool": "finish"}')
     skill = ch05.load_skill(ROOT / "skills/screen-anticoagulant-notes/SKILL.md")
@@ -487,7 +487,7 @@ def test_skill_instructions_reach_the_live_planner(monkeypatch):
 
 
 def test_mcp_rejects_bad_envelopes_before_any_tool_runs():
-    from ahe import mcp_server
+    from ahe.domains.hls import mcp_server
     backend, out = Submissions(), []
     run = ch05.ready(Harness(COORDINATOR, backend), P042)
     server = mcp_server.Server(Harness(COORDINATOR, backend), run)
