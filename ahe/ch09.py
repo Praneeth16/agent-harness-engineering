@@ -2,8 +2,8 @@
 
 Implements context-isolated read-only sub-agents with explicit
 depth, fan-out, step, and output-character budgets; a separate
-generator vs. evaluator loop; and an A2A 1.0.0 AgentCard and
-opaque async task server.
+generator vs. evaluator loop restoring all protected baselines;
+and a synchronous in-process A2A-inspired JSON-RPC adapter.
 """
 
 from copy import deepcopy
@@ -12,7 +12,7 @@ import json
 
 from .ch02 import (
     INVOICE_FIXED, PRICING_FIXED, TASK_INVOICE, WORKSPACE,
-    record, workspace_rev,
+    is_protected, is_writable, record, workspace_rev,
 )
 from .ch03 import assemble_context, build_prefix, sha12
 from .ch04 import CommitLog, HarnessV4, refuse, start_v4
@@ -54,7 +54,9 @@ class DelegationController:
                 f"{self.budget.max_fanout} delegations",
                 "synthesize prior sub-agent findings",
             )
-        req = set(requested_tools or READ_ONLY_TOOLS)
+        req = (set(READ_ONLY_TOOLS)
+               if requested_tools is None
+               else set(requested_tools))
         allowed = req & set(parent_tools) & READ_ONLY_TOOLS
         if not allowed:
             return refuse(
@@ -70,27 +72,37 @@ class DelegationController:
         child_harness = HarnessV4(
             CommitLog(), teach=True, allowed_tools=allowed)
         notes = []
+        steps = 0
         for _ in range(self.budget.max_steps):
             prop = child_planner(child_run, goal)
+            steps += 1
             tool = (prop.get("tool")
                     if isinstance(prop, dict) else None)
-            if tool not in allowed:
+            if not isinstance(tool, str) or (
+                    tool not in allowed):
                 notes.append(f"blocked:{tool}")
                 break
             if tool == "finish":
-                notes.append(prop.get("summary", "done"))
+                args = prop.get("args", {})
+                if not isinstance(args, dict) or args:
+                    notes.append("blocked:finish_args")
+                    break
+                raw_sum = prop.get("summary", "done")
+                notes.append(raw_sum
+                             if isinstance(raw_sum, str)
+                             else "done")
                 break
             res = child_harness.dispatch(child_run, prop)
             if "error" not in res and tool == "read_lines":
                 notes.append(
                     f"{res['path']}:L{res['start']}")
-        summary = "; ".join(notes)[
-            :self.budget.max_output_chars]
+        cap = self.budget.max_output_chars
+        summary = "; ".join(notes)[:cap]
         return {
             "ok": True,
-            "goal": goal,
+            "goal": str(goal)[:120],
             "summary": summary,
-            "child_steps": len(child_run.events),
+            "child_steps": steps,
             "isolated": True,
         }
 # end listing
@@ -106,9 +118,10 @@ class EvalVerdict:
 
 def evaluate_candidate(contract, files,
                        evaluator_checks=None):
-    """Independent evaluator: sees ONLY files + tests."""
-    rev = workspace_rev(files)
-    checks = contract.checks(files)
+    """Independent evaluator: grades an immutable copy."""
+    snap = deepcopy(files)
+    rev = workspace_rev(snap)
+    checks = contract.checks(deepcopy(snap))
     failed = sorted(k for k, v in checks.items()
                     if v != "pass")
     findings = []
@@ -116,7 +129,7 @@ def evaluate_candidate(contract, files,
         findings.append(
             f"deterministic failures: {', '.join(failed)}")
     for name, fn in (evaluator_checks or {}).items():
-        msg = fn(files)
+        msg = fn(deepcopy(snap))
         if msg:
             failed.append(name)
             findings.append(f"{name}: {msg}")
@@ -127,34 +140,42 @@ def evaluate_candidate(contract, files,
         findings=tuple(findings),
     )
 
+def _restore_baseline(contract, baseline, proposed):
+    """Keep only writable edits; restore protected files."""
+    clean = deepcopy(baseline)
+    if isinstance(proposed, dict):
+        for path, content in proposed.items():
+            if (isinstance(path, str)
+                    and isinstance(content, str)
+                    and not is_protected(path, contract)
+                    and is_writable(path, contract)):
+                clean[path] = content
+    return clean
+
 def generator_evaluator_loop(contract, files, generator,
                              evaluator_checks=None,
                              max_rounds=3):
     """Separate generator edits from independent grading."""
+    baseline = deepcopy(files)
     current = deepcopy(files)
     history = []
     for round_idx in range(1, max_rounds + 1):
         feedback = history[-1] if history else None
-        proposed = generator(deepcopy(current), feedback,
-                             round_idx)
-        # Protect immutable tests from generator tampering
-        for path in list(proposed):
-            if any(path.startswith(p)
-                   for p in contract.protected):
-                if path in current:
-                    proposed[path] = current[path]
-                else:
-                    del proposed[path]
+        raw = generator(deepcopy(current), feedback,
+                        round_idx)
+        candidate = _restore_baseline(
+            contract, baseline, raw)
         verdict = evaluate_candidate(
-            contract, proposed, evaluator_checks)
-        current = proposed
+            contract, candidate, evaluator_checks)
+        current = candidate
         history.append(verdict)
         if verdict.passed:
             return {"status": "completed",
                     "rounds": round_idx,
-                    "files": current, "history": history}
+                    "files": deepcopy(current),
+                    "history": history}
     return {"status": "failed", "rounds": max_rounds,
-            "files": current, "history": history}
+            "files": deepcopy(current), "history": history}
 # end listing
 
 
@@ -170,7 +191,7 @@ class AgentCard:
     output_modes: tuple = ("application/json",)
 
 class A2AServer:
-    """Minimal A2A 1.0.0 opaque async task adapter."""
+    """In-process A2A-inspired JSON-RPC task adapter."""
 
     def __init__(self, card, worker_fn):
         self.card = card
@@ -181,75 +202,71 @@ class A2AServer:
     def agent_card(self):
         return asdict(self.card)
 
+    def _err(self, req_id, code, msg):
+        return {"jsonrpc": "2.0", "id": req_id,
+                "error": {"code": code, "message": msg}}
+
     def handle(self, req):
         if (not isinstance(req, dict)
                 or req.get("jsonrpc") != "2.0"):
-            return {"jsonrpc": "2.0", "id": None,
-                    "error": {"code": -32600,
-                              "message": "invalid request"}}
+            return self._err(None, -32600,
+                             "invalid request")
         req_id = req.get("id")
         method = req.get("method")
-        params = req.get("params") or {}
+        params = req.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return self._err(req_id, -32602,
+                             "params must be object")
 
         if method == "agent/card":
             return {"jsonrpc": "2.0", "id": req_id,
                     "result": self.agent_card()}
 
         if method == "tasks/send":
+            skill = params.get("skill")
+            if (not isinstance(skill, str)
+                    or skill not in self.card.skills):
+                return self._err(req_id, -32602,
+                                 "unknown skill")
             self._seq += 1
             tid = f"a2a-task-{self._seq}"
-            skill = params.get("skill", "")
-            if skill not in self.card.skills:
-                return {
-                    "jsonrpc": "2.0", "id": req_id,
-                    "error": {"code": -32602,
-                              "message": "unknown skill"},
-                }
             task = {"id": tid, "state": "working",
                     "artifact": None}
             self._tasks[tid] = task
-            # Worker returns opaque artifact; internal trace
-            # and prompts stay hidden inside this boundary.
+            # Synchronous in-process execution; masks raw
+            # worker exceptions behind a public error code.
             try:
-                art = self.worker_fn(
-                    skill, params.get("input", {}))
+                inp = deepcopy(params.get("input", {}))
+                art = self.worker_fn(skill, inp)
                 task["state"] = "completed"
                 task["artifact"] = {
                     "mime": "application/json", "data": art}
-            except Exception as exc:
+            except Exception:
                 task["state"] = "failed"
-                task["error"] = str(exc)
+                task["error"] = "worker execution failed"
             return {"jsonrpc": "2.0", "id": req_id,
                     "result": deepcopy(task)}
 
-        if method == "tasks/get":
+        if method in ("tasks/get", "tasks/cancel"):
             tid = params.get("id")
+            if not isinstance(tid, str):
+                return self._err(req_id, -32602,
+                                 "id must be string")
             if tid not in self._tasks:
-                return {
-                    "jsonrpc": "2.0", "id": req_id,
-                    "error": {"code": -32004,
-                              "message": "task not found"},
-                }
-            return {"jsonrpc": "2.0", "id": req_id,
-                    "result": deepcopy(self._tasks[tid])}
-
-        if method == "tasks/cancel":
-            tid = params.get("id")
-            if tid not in self._tasks:
-                return {
-                    "jsonrpc": "2.0", "id": req_id,
-                    "error": {"code": -32004,
-                              "message": "task not found"},
-                }
+                return self._err(req_id, -32004,
+                                 "task not found")
             t = self._tasks[tid]
-            if t["state"] in ("submitted", "working"):
+            if (method == "tasks/cancel"
+                    and t["state"] in (
+                        "submitted", "working")):
                 t["state"] = "canceled"
             return {"jsonrpc": "2.0", "id": req_id,
                     "result": deepcopy(t)}
 
-        return {"jsonrpc": "2.0", "id": req_id,
-                "error": {"code": -32601,
-                          "message": "method not found"}}
+        return self._err(req_id, -32601,
+                         "method not found")
 # end listing
 
 
@@ -296,7 +313,6 @@ def benchmark_context_isolation():
     prefix = build_prefix(TASK_INVOICE, ws, tool_names)
     p_hash_before = sha12(prefix)
 
-    # Inline arm: parent reads 8 noisy docs + 2 code files
     inline_run = start_v4(TASK_INVOICE, ws)
     h = HarnessV4(CommitLog(), teach=True)
     for idx in range(1, 9):
@@ -318,7 +334,6 @@ def benchmark_context_isolation():
     inline_prompt, inline_meta = assemble_context(
         inline_run, char_budget=2600, tool_names=tool_names)
 
-    # Delegated arm: read-only sub-agent returns compact digest
     del_run = start_v4(TASK_INVOICE, ws)
     ctrl = DelegationController(SubAgentBudget())
     out = ctrl.delegate(

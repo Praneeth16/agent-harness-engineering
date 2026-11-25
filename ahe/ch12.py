@@ -1,13 +1,13 @@
 """Chapter 12: domain transfer, production ops, and 2027.
 
 Plugs three distinct domains (Workspace Ops, preserved HLS
-clinical-trial pre-screening, and Finance 10-K covenant audit)
-into the UNCHANGED first-principles harness kernel, links
-versions to traces, and runs the executable Assumption Ledger.
+clinical-trial pre-screening, and Finance Q3 covenant audit)
+into the UNCHANGED Ch 2/4/6 harness kernel, gates model-only
+upgrades, and runs the executable Assumption Ledger.
 """
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import datetime as dt
 import json
 
@@ -17,8 +17,7 @@ from .ch02 import (
 )
 from .ch04 import CommitLog, start_v4
 from .ch06 import Approval, ContainedHarness, args_digest
-from .ch10 import EvalCase, ReleasePolicy, evaluate_release
-from .ch10 import run_eval_suite
+from .ch10 import evaluate_release, run_eval_suite
 from .domains.finance.filing import (
     FINANCE_FIXED_VERDICT, FINANCE_WORKSPACE, verify_filing,
 )
@@ -46,8 +45,14 @@ def make_hls_plugin():
         except Exception:
             return {"hls_claim": "fail"}
         err = hls_ch01.check_claim(claim, truth)
-        return {"hls_claim": "pass" if err is None
-                else "fail"}
+        if err is not None:
+            return {"hls_claim": "fail"}
+        # Reject contradictory prose summaries.
+        summary = str(claim.get("summary", "")).lower()
+        if (claim.get("eligible") is not True
+                and "all criteria met" in summary):
+            return {"hls_claim": "fail"}
+        return {"hls_claim": "pass"}
 
     files = {
         "patient.json": json.dumps(patient, indent=2),
@@ -92,7 +97,7 @@ def run_on_shared_kernel(plugin):
     harness = ContainedHarness(CommitLog())
     run = start_v4(plugin.contract, plugin.files)
 
-    # 1. Protected path tamper is blocked across ALL domains
+    # 1. Protected path tamper is blocked across domains
     prot = plugin.contract.protected[0] + "tamper.txt"
     blocked = harness.dispatch(
         run, {"tool": "draft_patch",
@@ -143,16 +148,24 @@ class VersionStamp:
 def check_model_upgrade(cases, old_stamp, new_stamp,
                         old_runner, new_runner,
                         policy=None):
-    """Gate a model upgrade on held-out pass^k & cost."""
-    base = run_eval_suite(cases, old_runner,
+    """Gate a model-only upgrade on a fixed suite."""
+    suite = list(cases)
+    if (old_stamp.harness_version
+            != new_stamp.harness_version
+            or old_stamp.prompt_hash
+            != new_stamp.prompt_hash
+            or old_stamp.policy_version
+            != new_stamp.policy_version):
+        raise ValueError(
+            "model upgrade requires fixed harness/policy")
+    base = run_eval_suite(suite, old_runner,
                           split="heldout", trials=3, k=3)
-    cand = run_eval_suite(cases, new_runner,
+    cand = run_eval_suite(suite, new_runner,
                           split="heldout", trials=3, k=3)
     gate = evaluate_release(base, cand, policy=policy)
     return {
-        "from_model": old_stamp.model_id,
-        "to_model": new_stamp.model_id,
-        "harness_version": new_stamp.harness_version,
+        "from_stamp": asdict(old_stamp),
+        "to_stamp": asdict(new_stamp),
         "base_pass_pow_k": base["pass_pow_k"],
         "new_pass_pow_k": cand["pass_pow_k"],
         "new_cps": cand["cost_per_success"],
@@ -172,7 +185,9 @@ class LedgerControl:
 
 def decide_retirement(control, with_control_pow_k,
                       without_control_pow_k):
-    """Retire only scaffolds proven unneeded on heldout."""
+    """Retire only validated scaffolds proven unneeded."""
+    if control.kind not in ("scaffold", "control_plane"):
+        raise ValueError(f"bad kind: {control.kind!r}")
     if control.kind == "control_plane":
         return {
             "control": control.name,
@@ -217,7 +232,7 @@ def run_all_domain_transfers():
 
 
 def run_ledger_retirement_demo():
-    """Demonstrate scaffold retirement vs control-plane keep."""
+    """Illustrative scaffold retirement vs control-plane keep."""
     controls = [
         (LedgerControl(
             "verbose_format_nudge", "scaffold",

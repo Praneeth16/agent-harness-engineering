@@ -13,7 +13,10 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["ahe", "ahe.domains", "ahe.domains.hls"]
+packages = [
+    "ahe", "ahe.domains",
+    "ahe.domains.hls", "ahe.domains.finance",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

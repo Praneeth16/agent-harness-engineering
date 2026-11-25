@@ -1,11 +1,12 @@
-"""Chapter 12 Finance transfer domain: 10-K covenant audit.
+"""Chapter 12 Finance transfer domain: FY2026 Q3 covenant audit.
 
 Proves the universal harness kernel (Contract + HarnessV4 +
-ContainedHarness) transfers cleanly to financial statement
-analysis without modifying a single line of kernel code.
+ContainedHarness) transfers cleanly to quarterly financial
+statement review without modifying kernel code.
 """
 
 import json
+import math
 
 FILING_NUMBERS = {
     "company": "Acme Cloud Corp",
@@ -46,24 +47,49 @@ FINANCE_FIXED_VERDICT = json.dumps({
 }, indent=2) + "\n"
 
 
+def _finite_num(val):
+    return (isinstance(val, (int, float))
+            and not isinstance(val, bool)
+            and math.isfinite(val))
+
+
 def verify_filing(files):
     """Deterministic audit checks on analysis/verdict.json."""
-    out = {}
     try:
         filing = json.loads(files["filing/summary.json"])
         verdict = json.loads(files["analysis/verdict.json"])
     except Exception:
         return {"valid_json": "fail", "covenant": "fail",
                 "citation": "fail"}
-    out["valid_json"] = "pass"
-    breach = (filing["debt_to_ebitda"]
-              > filing["covenant_max_leverage"])
+    if not isinstance(filing, dict) or not isinstance(
+            verdict, dict):
+        return {"valid_json": "fail", "covenant": "fail",
+                "citation": "fail"}
+    lev = filing.get("debt_to_ebitda")
+    cap = filing.get("covenant_max_leverage")
+    rep_lev = verdict.get("leverage")
+    if not (_finite_num(lev) and _finite_num(cap)
+            and _finite_num(rep_lev)):
+        return {"valid_json": "fail", "covenant": "fail",
+                "citation": "fail"}
+
+    breach = lev > cap
     covenant_ok = (
         verdict.get("covenant_breach") is breach
         and verdict.get("healthy") is (not breach)
+        and abs(float(rep_lev) - float(lev)) < 1e-6
     )
-    out["covenant"] = "pass" if covenant_ok else "fail"
-    cit = str(verdict.get("citation", ""))
-    out["citation"] = ("pass" if "Note 4" in cit
-                       else "fail")
-    return out
+    footnote = files.get("filing/footnote_4.txt", "")
+    cit = verdict.get("citation")
+    citation_ok = (
+        isinstance(footnote, str)
+        and "Note 4" in footnote
+        and isinstance(cit, str)
+        and "Note 4" in cit
+        and cit in footnote
+    )
+    return {
+        "valid_json": "pass",
+        "covenant": "pass" if covenant_ok else "fail",
+        "citation": "pass" if citation_ok else "fail",
+    }

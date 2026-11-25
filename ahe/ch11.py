@@ -2,7 +2,7 @@
 
 Implements a 4-stage modular harness evolution loop across 4
 unlocked runtime surfaces while locking the evaluator and
-containment layers behind an immutable checksum gate.
+containment layers behind a checksummed held-out gate.
 """
 
 from copy import deepcopy
@@ -44,13 +44,26 @@ class EvolutionProposal:
     edits_evaluator: bool = False
 
 def validate_proposal(prop):
-    """Reject locked-surface or grader-tampering edits."""
+    """Reject locked surfaces and out-of-range values."""
     if prop.edits_evaluator:
         return "blocked: evaluator modification forbidden"
     if prop.surface in LOCKED_SURFACES:
         return f"blocked: surface {prop.surface} is locked"
     if prop.surface not in UNLOCKED_SURFACES:
         return f"blocked: unknown surface {prop.surface}"
+    v = prop.new_value
+    if prop.surface == "prompt_policy" and (
+            v not in ("compact", "verbose")):
+        return "blocked: invalid prompt_policy"
+    if prop.surface == "tool_refusal" and (
+            v not in ("terse", "teaching")):
+        return "blocked: invalid tool_refusal"
+    if prop.surface == "context_budget" and (
+            type(v) is not int or not 1200 <= v <= 4800):
+        return "blocked: context_budget out of range"
+    if prop.surface == "retry_budget" and (
+            type(v) is not int or not 1 <= v <= 4):
+        return "blocked: retry_budget out of range"
     return None
 # end listing
 
@@ -106,10 +119,18 @@ def propose_modular_patch(diagnosis, config, prop_id):
 
 
 # listing 11.3
+def _checks_sig(fn):
+    code = getattr(fn, "__code__", None)
+    raw = (getattr(fn, "__qualname__", repr(fn)).encode()
+           + (code.co_code if code else b""))
+    return hashlib.sha256(raw).hexdigest()[:16]
+
 def evaluator_checksum(cases):
-    """Tamper-evident hash of held-out test definitions."""
+    """Hash held-out protected fixtures and check code."""
     held = [
         {"id": c.case_id,
+         "critical": c.critical,
+         "checks_sig": _checks_sig(c.contract.checks),
          "protected": list(c.contract.protected),
          "tests": {k: v for k, v in sorted(c.files.items())
                    if any(k.startswith(p)
@@ -120,7 +141,7 @@ def evaluator_checksum(cases):
     return hashlib.sha256(blob).hexdigest()[:16]
 
 class EvolutionGate:
-    """Stages 3 & 4: fresh held-out gate + ledger."""
+    """Stages 3 & 4: fresh held-out gate + audit ledger."""
 
     def __init__(self, cases, runner_factory,
                  max_cost_per_success=0.01):
@@ -159,7 +180,6 @@ class EvolutionGate:
         )
         cand = self.evaluate(cand_cfg)
 
-        # Verify evaluator hash stayed identical after run
         if evaluator_checksum(self.cases) != (
                 self.expected_hash):
             rec = {"proposal_id": proposal.proposal_id,
@@ -170,6 +190,14 @@ class EvolutionGate:
             self.ledger.append(rec)
             return current_cfg, rec
 
+        base_by = {r["case_id"]: r
+                   for r in base["per_case"]}
+        crit_slip = any(
+            r["critical"]
+            and r["pass_pow_k"] < base_by[
+                r["case_id"]]["pass_pow_k"]
+            for r in cand["per_case"]
+        )
         cps = cand["cost_per_success"]
         within_cost = (cps is not None
                        and cps <= self.max_cps)
@@ -180,11 +208,14 @@ class EvolutionGate:
                 and base["cost_per_success"] is not None
                 and cps < base["cost_per_success"])
         )
-        promoted = within_cost and improved
+        promoted = (not crit_slip) and within_cost and (
+            improved)
         reason = (
             "promoted: held-out pass^k improved"
             if promoted
-            else "rejected: no held-out gain within cap"
+            else ("rejected: critical case regressed"
+                  if crit_slip
+                  else "rejected: no gain within cap")
         )
         rec = {
             "proposal_id": proposal.proposal_id,
@@ -204,15 +235,12 @@ def _sim_runner_factory(config):
     from .ch10 import _good_files, _partial_files
 
     def runner(case, trial):
-        # Terse mode struggles on held-out repeats (1/3);
-        # prompt_policy="verbose" adds cost without fixing
-        # gate thrashing; tool_refusal="teaching" reaches 3/3!
         if config.tool_refusal == "teaching":
             ok = True
             cost = 0.0024
         elif config.prompt_policy == "verbose":
             ok = (trial <= 2)
-            cost = 0.0150  # blows past cost cap!
+            cost = 0.0150
         else:
             ok = (trial == 1)
             cost = 0.0020
@@ -225,31 +253,28 @@ def _sim_runner_factory(config):
 
 
 def benchmark_evolution_cycle():
-    """Run baseline + 3 competing proposals through the gate."""
+    """Run baseline + 3 simulated proposals through gate."""
     cases = make_eval_cases()
     gate = EvolutionGate(cases, _sim_runner_factory,
                          max_cost_per_success=0.01)
     cfg = HarnessConfig()
     base = gate.evaluate(cfg)
 
-    # Proposal A: verbose prompt bloats cost past cap -> reject
     p_verbose = EvolutionProposal(
         "p-verbose", "prompt_policy", "verbose",
         "stuff long instructions into prompt")
     cfg, rec_a = gate.try_proposal(cfg, p_verbose)
 
-    # Proposal B: tries to weaken evaluator -> blocked instantly
     p_tamper = EvolutionProposal(
         "p-tamper", "evaluator", "skip_invoice_check",
         "relax invoice check to raise score",
         edits_evaluator=True)
     cfg, rec_b = gate.try_proposal(cfg, p_tamper)
 
-    # Proposal C: diagnosed modular tool_refusal patch -> promote
     diag = diagnose_traces([
         {"refusals": 10, "evictions": 0},
-        {"refusals": 9, "evictions": 1},
-        {"refusals": 11, "evictions": 0},
+        {"refusals": 10, "evictions": 0},
+        {"refusals": 10, "evictions": 0},
     ])
     p_mod = propose_modular_patch(diag, cfg, "p-teach")
     cfg, rec_c = gate.try_proposal(cfg, p_mod)

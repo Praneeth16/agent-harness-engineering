@@ -1,28 +1,37 @@
 """Chapter 10: tracing, evaluation harnesses, and release gates.
 
-Implements OpenTelemetry GenAI semantic spans, an independent
-dev/held-out evaluation harness computing pass@k, pass^k, and
-cost-per-verified-success, and a CI release gate that blocks
-regressions hidden behind optimistic dev scores.
+Implements OTel-shaped GenAI spans, an independent dev/held-out
+evaluation harness computing pass@k, pass^k, and cost per
+verified success, and a CI release gate that checks suite
+identity, critical regressions, and finite metric bounds.
 """
 
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import datetime as dt
-import hashlib
 import json
 import math
 import uuid
 
-from .ch01 import PRICING_BUGGY, PRICING_FIXED, TEST_SPEC
+from .ch01 import PRICING_FIXED
 from .ch02 import (
-    Contract, INVOICE_BUGGY, INVOICE_FIXED, TASK_INVOICE,
-    WORKSPACE, verify_invoice,
+    INVOICE_FIXED, TASK_INVOICE, WORKSPACE, is_protected,
+    is_writable,
 )
 
 
 def _utc_now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _finite_nonneg(val, name):
+    if isinstance(val, bool) or not isinstance(
+            val, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+    f = float(val)
+    if not math.isfinite(f) or f < 0.0:
+        raise ValueError(f"{name} must be finite >= 0")
+    return f
 
 
 # listing 10.1
@@ -46,6 +55,7 @@ class GenAISpan:
             "trace_id": self.trace_id,
             "span_id": self.span_id,
             "parent_span_id": self.parent_span_id,
+            "timestamp": self.timestamp,
             "name": f"gen_ai.{self.operation}",
             "status": self.status,
             "duration_ms": self.duration_ms,
@@ -62,7 +72,7 @@ class GenAISpan:
         }
 
 class TraceExporter:
-    """Append-only OTel GenAI span collector & JSONL."""
+    """Append-only OTel-shaped GenAI span collector."""
 
     def __init__(self, harness_version="v2.10"):
         self.harness_version = harness_version
@@ -73,17 +83,18 @@ class TraceExporter:
              duration_ms=0.0, status="ok",
              parent_span_id=None):
         span = GenAISpan(
-            trace_id=trace_id,
+            trace_id=str(trace_id),
             span_id=uuid.uuid4().hex[:16],
             parent_span_id=parent_span_id,
-            operation=operation,
-            model=model,
+            operation=str(operation),
+            model=str(model),
             harness_version=self.harness_version,
             input_tokens=int(input_tokens),
             output_tokens=int(output_tokens),
-            cost_usd=float(cost_usd),
-            duration_ms=float(duration_ms),
-            status=status,
+            cost_usd=_finite_nonneg(cost_usd, "cost_usd"),
+            duration_ms=_finite_nonneg(
+                duration_ms, "duration_ms"),
+            status=str(status),
             timestamp=_utc_now(),
         )
         self.spans.append(span)
@@ -91,7 +102,8 @@ class TraceExporter:
 
     def to_jsonl(self):
         return "\n".join(
-            json.dumps(s.to_otel(), sort_keys=True)
+            json.dumps(s.to_otel(), sort_keys=True,
+                       allow_nan=False)
             for s in self.spans
         )
 # end listing
@@ -102,7 +114,7 @@ class TraceExporter:
 class EvalCase:
     case_id: str
     split: str               # "dev" | "heldout"
-    contract: Contract
+    contract: object
     files: dict
     critical: bool = False
 
@@ -125,32 +137,54 @@ def pass_pow_k(outcomes, k):
 
 def run_eval_suite(cases, runner_fn, split="heldout",
                    trials=3, k=3):
-    """Grade only hidden deterministic checks per split."""
+    """Grade isolated copies; restore protected files."""
     selected = [c for c in cases if c.split == split]
+    if not selected:
+        raise ValueError(f"no cases for split: {split}")
+    seen_ids = set()
     per_case = []
     total_cost = 0.0
     total_passes = 0
     total_trials = 0
 
     for case in selected:
+        if case.case_id in seen_ids:
+            raise ValueError(
+                f"duplicate case_id: {case.case_id}")
+        seen_ids.add(case.case_id)
+        baseline = deepcopy(case.files)
         outcomes = []
         case_cost = 0.0
         for t in range(1, trials + 1):
-            # Runner gets a fresh copy; hidden grader runs
-            # against original protected test definitions.
-            out = runner_fn(case, t)
-            cand = deepcopy(out.get("files", {}))
-            for p in case.contract.protected:
-                for path in list(cand):
-                    if path.startswith(p):
-                        del cand[path]
-                for path, src in case.files.items():
-                    if path.startswith(p):
+            # Runner receives an isolated EvalCase copy.
+            public = EvalCase(
+                case.case_id, case.split, case.contract,
+                deepcopy(baseline), case.critical)
+            out = runner_fn(public, t)
+            if not isinstance(out, dict) or (
+                    "cost_usd" not in out):
+                raise ValueError(
+                    "runner output must include cost_usd")
+            cost = _finite_nonneg(
+                out["cost_usd"], "cost_usd")
+            cand = deepcopy(baseline)
+            proposed = out.get("files", {})
+            if isinstance(proposed, dict):
+                for path, src in proposed.items():
+                    if (isinstance(path, str)
+                            and isinstance(src, str)
+                            and not is_protected(
+                                path, case.contract)
+                            and is_writable(
+                                path, case.contract)):
                         cand[path] = src
             checks = case.contract.checks(cand)
-            ok = all(v == "pass" for v in checks.values())
+            ok = (isinstance(checks, dict)
+                  and len(checks) > 0
+                  and all(v == "pass"
+                          for v in checks.values()))
             outcomes.append(ok)
-            case_cost += float(out.get("cost_usd", 0.0))
+            case_cost += cost
         total_cost += case_cost
         total_passes += sum(1 for o in outcomes if o)
         total_trials += len(outcomes)
@@ -159,28 +193,25 @@ def run_eval_suite(cases, runner_fn, split="heldout",
             "critical": case.critical,
             "passed": sum(1 for o in outcomes if o),
             "trials": len(outcomes),
-            "pass_at_k": round(pass_at_k(outcomes, k), 4),
-            "pass_pow_k": round(pass_pow_k(outcomes, k), 4),
-            "cost_usd": round(case_cost, 6),
+            "pass_at_k": pass_at_k(outcomes, k),
+            "pass_pow_k": pass_pow_k(outcomes, k),
+            "cost_usd": case_cost,
         })
 
-    n = len(per_case) or 1
+    n = len(per_case)
     mean_at = sum(r["pass_at_k"] for r in per_case) / n
     mean_pow = sum(r["pass_pow_k"] for r in per_case) / n
     cps = (total_cost / total_passes
-           if total_passes > 0 else float("inf"))
+           if total_passes > 0 else None)
     return {
-        "split": split,
-        "k": k,
-        "cases": len(per_case),
+        "split": split, "k": k, "trials": trials,
+        "cases": n,
         "passed_trials": total_passes,
         "total_trials": total_trials,
-        "pass_at_k": round(mean_at, 4),
-        "pass_pow_k": round(mean_pow, 4),
-        "total_cost_usd": round(total_cost, 6),
-        "cost_per_success": (round(cps, 6)
-                             if math.isfinite(cps)
-                             else None),
+        "pass_at_k": mean_at,
+        "pass_pow_k": mean_pow,
+        "total_cost_usd": total_cost,
+        "cost_per_success": cps,
         "per_case": per_case,
     }
 # end listing
@@ -193,38 +224,60 @@ class ReleasePolicy:
     max_cost_per_success: float = 0.01
     block_critical_regression: bool = True
 
+def _valid_prob(v):
+    return (isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and math.isfinite(v) and 0.0 <= v <= 1.0)
+
 def evaluate_release(baseline, candidate, policy=None):
-    """Gate shipment strictly on held-out metrics."""
+    """Gate shipment strictly on matched held-out suites."""
     pol = policy or ReleasePolicy()
     reasons = []
-    if candidate["split"] != "heldout":
+    if candidate.get("split") != "heldout":
         reasons.append("gate requires heldout split")
-    if candidate["pass_pow_k"] < pol.min_pass_pow_k:
+    if candidate.get("k") != baseline.get("k"):
+        reasons.append("k mismatch vs baseline")
+    if candidate.get("trials") != baseline.get("trials"):
+        reasons.append("trials mismatch vs baseline")
+
+    base_by = {r["case_id"]: r
+               for r in baseline.get("per_case", [])}
+    cand_by = {r["case_id"]: r
+               for r in candidate.get("per_case", [])}
+    if not base_by or set(cand_by) != set(base_by):
+        reasons.append("case manifest mismatch")
+
+    cpow = candidate.get("pass_pow_k")
+    bpow = baseline.get("pass_pow_k")
+    if not _valid_prob(cpow) or not _valid_prob(bpow):
+        reasons.append("invalid pass^k value")
+    elif cpow < pol.min_pass_pow_k:
         reasons.append(
-            f"pass^k {candidate['pass_pow_k']:.2f} "
-            f"< {pol.min_pass_pow_k:.2f}")
-    cps = candidate["cost_per_success"]
-    if cps is None or cps > pol.max_cost_per_success:
+            f"pass^k {cpow:.2f} < {pol.min_pass_pow_k:.2f}")
+
+    cps = candidate.get("cost_per_success")
+    if (cps is None or isinstance(cps, bool)
+            or not isinstance(cps, (int, float))
+            or not math.isfinite(cps)
+            or cps > pol.max_cost_per_success):
         reasons.append(
             f"cost/success {cps} "
             f"> {pol.max_cost_per_success}")
+
     if pol.block_critical_regression:
-        base_by = {r["case_id"]: r
-                   for r in baseline["per_case"]}
-        for r in candidate["per_case"]:
-            b = base_by.get(r["case_id"])
-            if (r["critical"] and b
-                    and r["pass_pow_k"] < b["pass_pow_k"]):
+        for cid, b in base_by.items():
+            c = cand_by.get(cid)
+            if (b.get("critical") and c
+                    and c["pass_pow_k"] < b["pass_pow_k"]):
                 reasons.append(
-                    f"critical regression on "
-                    f"{r['case_id']}")
-    return {
-        "ship": len(reasons) == 0,
-        "reasons": reasons,
-        "delta_pass_pow_k": round(
-            candidate["pass_pow_k"]
-            - baseline["pass_pow_k"], 4),
-    }
+                    f"critical regression on {cid}")
+
+    delta = (round(cpow - bpow, 4)
+             if (_valid_prob(cpow) and _valid_prob(bpow))
+             else None)
+    return {"ship": len(reasons) == 0,
+            "reasons": reasons,
+            "delta_pass_pow_k": delta}
 # end listing
 
 
@@ -258,11 +311,10 @@ def _partial_files(ws):
 
 
 def benchmark_release_candidates():
-    """Compare baseline, overfit-dev, and reliable candidate."""
+    """Scripted gate benchmark: baseline, overfit, hardened."""
     cases = make_eval_cases()
 
     def baseline_runner(case, trial):
-        # 2/3 reliability on HELD-03, 3/3 on critical cases
         ok = not (case.case_id == "HELD-03" and trial == 3)
         return {
             "files": (_good_files(case.files)
@@ -271,7 +323,6 @@ def benchmark_release_candidates():
         }
 
     def overfit_runner(case, trial):
-        # 100% on dev, flaky 1/3 on heldout + false summary!
         ok = (case.split == "dev") or (trial == 1)
         return {
             "files": (_good_files(case.files)
@@ -281,7 +332,6 @@ def benchmark_release_candidates():
         }
 
     def hardened_runner(case, trial):
-        # 100% reliable across all 3 repeats on dev & heldout
         return {
             "files": _good_files(case.files),
             "cost_usd": 0.0022,

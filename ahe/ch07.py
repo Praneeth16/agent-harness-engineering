@@ -1,9 +1,9 @@
 """Chapter 7: durable execution and long-running sessions.
 
 Persists run state, step intents/outcomes, idempotent commits,
-and cross-session task ledgers in SQLite (WAL mode) so a crash
-mid-turn resumes cleanly with zero duplicate model calls and
-zero duplicate side effects.
+and cross-session task ledgers in SQLite (WAL mode) using
+atomic transactions so crash recovery never loses acknowledged
+state or repeats completed steps.
 """
 
 from copy import deepcopy
@@ -17,7 +17,10 @@ from .ch02 import (
     INVOICE_FIXED, PRICING_FIXED, Run, TASK_INVOICE,
     WORKSPACE, record, workspace_rev,
 )
-from .ch04 import CommitLog, HarnessV4, refuse, start_v4
+from .ch04 import (
+    CommitLog, HarnessV4, MAX_PROPOSAL_CHARS, refuse,
+    start_v4,
+)
 
 
 class SimulatedCrash(RuntimeError):
@@ -28,10 +31,9 @@ def _utc_now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def _hash_payload(payload):
-    blob = json.dumps(payload, sort_keys=True,
-                      separators=(",", ":"))
-    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+def _check_run_id(run_id):
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("run_id must be a non-empty string")
 
 
 # listing 7.1
@@ -92,8 +94,8 @@ class DurableStore:
         """)
         self.conn.commit()
 
-    def save_run(self, run_id, run):
-        self.conn.execute(
+    def _upsert_run(self, cur, run_id, run):
+        cur.execute(
             """INSERT OR REPLACE INTO runs VALUES
                (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (run_id, run.contract.task_id, run.state,
@@ -106,19 +108,29 @@ class DurableStore:
              json.dumps(run.events, sort_keys=True),
              _utc_now()),
         )
-        self.conn.commit()
+
+    def save_run(self, run_id, run):
+        _check_run_id(run_id)
+        with self.conn:
+            self._upsert_run(self.conn, run_id, run)
 
     def load_run(self, run_id, contract):
+        _check_run_id(run_id)
         row = self.conn.execute(
-            "SELECT state, reason, rev, verified_rev, "
-            "steps_used, edits_used, files_json, "
-            "drafts_json, checks_json, events_json "
-            "FROM runs WHERE run_id=?", (run_id,),
+            "SELECT task_id, state, reason, rev, "
+            "verified_rev, steps_used, edits_used, "
+            "files_json, drafts_json, checks_json, "
+            "events_json FROM runs WHERE run_id=?",
+            (run_id,),
         ).fetchone()
         if row is None:
             return None
-        (state, reason, rev, vrev, s_u, e_u,
+        (tid, state, reason, rev, vrev, s_u, e_u,
          f_js, d_js, c_js, ev_js) = row
+        if tid != contract.task_id:
+            raise ValueError(
+                f"contract mismatch: {tid} != "
+                f"{contract.task_id}")
         run = Run(id=run_id, contract=contract,
                   files=json.loads(f_js), rev=rev,
                   events=json.loads(ev_js),
@@ -131,26 +143,33 @@ class DurableStore:
 
     def record_intent(self, run_id, step_index, proposal,
                       replay="safe"):
-        self.conn.execute(
-            """INSERT OR REPLACE INTO steps VALUES
-               (?, ?, 'intent', ?, ?, NULL, ?)""",
-            (run_id, step_index, replay,
-             json.dumps(proposal, sort_keys=True),
-             _utc_now()),
-        )
-        self.conn.commit()
+        _check_run_id(run_id)
+        with self.conn:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO steps VALUES
+                   (?, ?, 'intent', ?, ?, NULL, ?)""",
+                (run_id, step_index, replay,
+                 json.dumps(proposal, sort_keys=True),
+                 _utc_now()),
+            )
 
-    def record_outcome(self, run_id, step_index, result):
-        self.conn.execute(
-            """UPDATE steps SET phase='completed',
-               result_json=?, updated_at=?
-               WHERE run_id=? AND step_index=?""",
-            (json.dumps(result, sort_keys=True),
-             _utc_now(), run_id, step_index),
-        )
-        self.conn.commit()
+    def complete_step(self, run_id, step_index, result,
+                      run):
+        # Atomic transaction: step outcome + run snapshot
+        # commit together so state cannot diverge on crash.
+        _check_run_id(run_id)
+        with self.conn:
+            self.conn.execute(
+                """UPDATE steps SET phase='completed',
+                   result_json=?, updated_at=?
+                   WHERE run_id=? AND step_index=?""",
+                (json.dumps(result, sort_keys=True),
+                 _utc_now(), run_id, step_index),
+            )
+            self._upsert_run(self.conn, run_id, run)
 
     def get_step(self, run_id, step_index):
+        _check_run_id(run_id)
         row = self.conn.execute(
             "SELECT phase, replay, proposal_json, "
             "result_json FROM steps "
@@ -166,27 +185,36 @@ class DurableStore:
                        if row[3] is not None else None),
         }
 
-    def commit_once(self, run_id, key, files_hash, fn):
+    def next_step_index(self, run_id):
         row = self.conn.execute(
-            "SELECT files_hash, result_json FROM commits "
-            "WHERE run_id=? AND commit_key=?",
-            (run_id, key),
+            "SELECT COUNT(*) FROM steps WHERE run_id=?",
+            (run_id,),
         ).fetchone()
-        if row is not None:
-            if row[0] != files_hash:
-                return refuse(
-                    "idempotency key conflict",
-                    f"key {key!r} bound to another patch",
-                    "use a new key for a changed patch",
-                )
-            return {**json.loads(row[1]), "replayed": True}
-        res = fn()
-        self.conn.execute(
-            "INSERT INTO commits VALUES (?, ?, ?, ?)",
-            (run_id, key, files_hash,
-             json.dumps(res, sort_keys=True)),
-        )
-        self.conn.commit()
+        return int(row[0]) if row else 0
+
+    def commit_once(self, run_id, key, files_hash, fn):
+        _check_run_id(run_id)
+        with self.conn:
+            row = self.conn.execute(
+                "SELECT files_hash, result_json "
+                "FROM commits WHERE run_id=? "
+                "AND commit_key=?", (run_id, key),
+            ).fetchone()
+            if row is not None:
+                if row[0] != files_hash:
+                    return refuse(
+                        "idempotency key conflict",
+                        f"key {key!r} bound to another",
+                        "use a new key for a new patch",
+                    )
+                return {**json.loads(row[1]),
+                        "replayed": True}
+            res = fn()
+            blob = json.dumps(res, sort_keys=True)
+            self.conn.execute(
+                "INSERT INTO commits VALUES (?,?,?,?)",
+                (run_id, key, files_hash, blob),
+            )
         return {**res, "replayed": False}
 
     def close(self):
@@ -203,6 +231,21 @@ REPLAY_MODE = {
     "finish": "safe",
     "send_webhook": "reconcile",
 }
+
+def _sanitize_proposal(raw):
+    """Bound and type-check proposals before SQLite."""
+    if not isinstance(raw, dict):
+        return None, "proposal is not an object"
+    tool = raw.get("tool")
+    if not isinstance(tool, str) or not tool.strip():
+        return None, "tool name must be a string"
+    try:
+        blob = json.dumps(raw, sort_keys=True)
+    except TypeError:
+        return None, "proposal not JSON serializable"
+    if len(blob) > MAX_PROPOSAL_CHARS:
+        return None, "proposal exceeds size cap"
+    return raw, None
 
 class DurableCommitBackend:
     """SQLite-backed CommitLog compatible with HarnessV4."""
@@ -246,13 +289,29 @@ class DurableRunner:
             run = start_v4(contract, files)
             run.id = run_id
             self.store.save_run(run_id, run)
-        if run.state != "running":
-            return run, None
 
+        # Replay recorded step even if run is now terminal.
         existing = self.store.get_step(run_id, step_index)
         if existing and existing["phase"] == "completed":
             self.replayed_steps += 1
             return run, existing["result"]
+        if run.state != "running":
+            return run, None
+
+        if existing is None:
+            want = self.store.next_step_index(run_id)
+            if step_index != want:
+                raise ValueError(
+                    f"expected step {want}, got "
+                    f"{step_index}")
+            if run.steps_used >= run.contract.budget.steps:
+                run.state = "blocked"
+                run.reason = "step budget spent"
+                record(run, "stop", state=run.state,
+                       reason=run.reason)
+                self.store.save_run(run_id, run)
+                return run, refuse(
+                    "step budget spent", run.reason, "stop")
 
         if existing and existing["phase"] == "intent":
             proposal = existing["proposal"]
@@ -265,10 +324,22 @@ class DurableRunner:
                 self.store.save_run(run_id, run)
                 return run, {"error": run.reason}
         else:
-            proposal = planner(run)
+            raw = planner(run)
             self.model_calls += 1
-            tool = (proposal.get("tool")
-                    if isinstance(proposal, dict) else "")
+            proposal, bad = _sanitize_proposal(raw)
+            if bad is not None:
+                err = refuse(bad, "invalid proposal",
+                             "send bounded tool JSON")
+                self.store.record_intent(
+                    run_id, step_index,
+                    {"tool": "_invalid", "error": bad},
+                    "safe")
+                record(run, "observation", tool=None,
+                       result=err)
+                self.store.complete_step(
+                    run_id, step_index, err, run)
+                return run, err
+            tool = proposal["tool"]
             replay = REPLAY_MODE.get(tool, "reconcile")
             self.store.record_intent(
                 run_id, step_index, proposal, replay)
@@ -279,8 +350,8 @@ class DurableRunner:
         backend = DurableCommitBackend(self.store, run_id)
         harness = HarnessV4(backend, teach=True)
         res = harness.dispatch(run, proposal)
-        self.store.record_outcome(run_id, step_index, res)
-        self.store.save_run(run_id, run)
+        self.store.complete_step(
+            run_id, step_index, res, run)
         if crash_after_outcome:
             raise SimulatedCrash(
                 f"crashed after outcome {step_index}")
@@ -307,15 +378,18 @@ class TaskLedger:
         self.store = store
 
     def upsert(self, run_id, item):
+        _check_run_id(run_id)
         if item.status not in self.VALID:
             raise ValueError(f"bad status: {item.status}")
-        self.store.conn.execute(
-            """INSERT OR REPLACE INTO ledger VALUES
-               (?, ?, ?, ?, ?, ?, ?)""",
-            (run_id, item.item_id, item.title,
-             item.status, item.rev, item.note, _utc_now()),
-        )
-        self.store.conn.commit()
+        with self.conn if hasattr(self, "conn") else (
+                self.store.conn):
+            self.store.conn.execute(
+                """INSERT OR REPLACE INTO ledger VALUES
+                   (?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, item.item_id, item.title,
+                 item.status, item.rev, item.note,
+                 _utc_now()),
+            )
 
     def items(self, run_id):
         rows = self.store.conn.execute(
@@ -327,8 +401,8 @@ class TaskLedger:
 
     def resume_summary(self, run_id):
         items = self.items(run_id)
-        done = [i.item_id for i in items
-                if i.status == "verified"]
+        done = [{"id": i.item_id, "rev": i.rev}
+                for i in items if i.status == "verified"]
         open_items = [
             {"id": i.item_id, "title": i.title,
              "status": i.status, "rev": i.rev}
@@ -375,11 +449,9 @@ def _v4_fix_planner(run):
 
 
 def benchmark_crash_recovery(crash_steps=(2, 4, 6)):
-    """Compare naive restart vs SQLite durable recovery."""
+    """Simulated crash benchmark: naive restart vs WAL."""
     rows = []
     for crash_at in crash_steps:
-        # 1) Naive restart: crashes after step crash_at,
-        # loses memory, starts from step 0 -> pays twice.
         naive_calls = 0
         naive_commits = 0
         for attempt in range(2):
@@ -390,15 +462,13 @@ def benchmark_crash_recovery(crash_steps=(2, 4, 6)):
                     break
                 prop = _v4_fix_planner(run)
                 naive_calls += 1
+                if attempt == 0 and idx == crash_at:
+                    break
                 res = h.dispatch(run, prop)
                 if (prop["tool"] == "commit_patch"
                         and "error" not in res):
                     naive_commits += 1
-                if attempt == 0 and idx == crash_at:
-                    break
 
-        # 2) Durable SQLite recovery: crashes after intent
-        # on crash_at, restarts fresh DurableRunner on same DB.
         store = DurableStore(":memory:")
         r1 = DurableRunner(store)
         run_id = f"run-crash-{crash_at}"

@@ -2,8 +2,8 @@
 
 Separates working state, workspace truth, scoped episodic
 memory, and gated procedural skills. Enforces tenant/repo
-isolation, TTL expiry, append-only supersession without
-rewriting traces, and provenance-gated offline consolidation.
+isolation, UTC-normalized TTL expiry, atomic append-only
+supersession, and provenance-gated offline consolidation.
 """
 
 from dataclasses import dataclass
@@ -12,11 +12,19 @@ import json
 import sqlite3
 
 from .ch02 import workspace_rev
-from .ch03 import build_prefix, sha12
+from .ch03 import OverBudget, build_prefix, sha12
 
 
-def _iso(ts):
-    return ts.astimezone(dt.timezone.utc).isoformat()
+def _norm_iso(ts):
+    if isinstance(ts, str):
+        parsed = dt.datetime.fromisoformat(ts)
+    elif isinstance(ts, dt.datetime):
+        parsed = ts
+    else:
+        raise ValueError("timestamp must be datetime or ISO")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc).isoformat()
 
 
 # listing 8.1
@@ -56,44 +64,64 @@ class MemoryStore:
         """)
         self.conn.commit()
 
-    def put(self, rec):
+    def _validate(self, rec):
         if rec.plane not in ("episodic", "procedural"):
             raise ValueError(f"bad plane: {rec.plane}")
-        if not rec.source_event_id.strip():
+        if (not isinstance(rec.content, str)
+                or not rec.content.strip()):
+            raise ValueError("content must be text")
+        if (not isinstance(rec.source_event_id, str)
+                or not rec.source_event_id.strip()):
             raise ValueError("missing provenance event")
-        self.conn.execute(
+
+    def _insert(self, cur, rec):
+        cur.execute(
             """INSERT INTO memories VALUES
                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (rec.memory_id, rec.tenant_id, rec.repo_id,
              rec.plane, rec.key, rec.content,
-             rec.source_event_id, rec.created_at,
-             rec.expires_at, rec.status, rec.supersedes),
+             rec.source_event_id,
+             _norm_iso(rec.created_at),
+             _norm_iso(rec.expires_at),
+             rec.status, rec.supersedes),
         )
-        self.conn.commit()
+
+    def put(self, rec):
+        self._validate(rec)
+        with self.conn:
+            self._insert(self.conn, rec)
         return rec
 
     def supersede(self, old_id, new_rec):
+        self._validate(new_rec)
         if new_rec.supersedes != old_id:
             raise ValueError("supersedes link mismatch")
-        row = self.conn.execute(
-            "SELECT tenant_id, repo_id FROM memories "
-            "WHERE memory_id=?", (old_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"unknown memory: {old_id}")
-        if (row[0], row[1]) != (
-                new_rec.tenant_id, new_rec.repo_id):
-            raise ValueError("cross-scope supersede")
-        self.conn.execute(
-            "UPDATE memories SET status='superseded' "
-            "WHERE memory_id=?", (old_id,),
-        )
-        self.put(new_rec)
+        if new_rec.status != "active":
+            raise ValueError("replacement must be active")
+        with self.conn:
+            row = self.conn.execute(
+                "SELECT tenant_id, repo_id, plane, key, "
+                "status FROM memories WHERE memory_id=?",
+                (old_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown memory: {old_id}")
+            if row[4] != "active":
+                raise ValueError("predecessor not active")
+            if row[:4] != (
+                    new_rec.tenant_id, new_rec.repo_id,
+                    new_rec.plane, new_rec.key):
+                raise ValueError("cross-scope supersede")
+            self.conn.execute(
+                "UPDATE memories SET status='superseded' "
+                "WHERE memory_id=?", (old_id,),
+            )
+            self._insert(self.conn, new_rec)
         return new_rec
 
     def query(self, tenant_id, repo_id, plane="episodic",
               now=None):
-        now_iso = _iso(
+        now_iso = _norm_iso(
             now or dt.datetime.now(dt.timezone.utc))
         rows = self.conn.execute(
             """SELECT memory_id, tenant_id, repo_id, plane,
@@ -102,22 +130,25 @@ class MemoryStore:
                       supersedes
                FROM memories
                WHERE tenant_id=? AND repo_id=? AND plane=?
-                 AND status='active' AND expires_at > ?
+                 AND status='active'
+                 AND created_at <= ? AND expires_at > ?
                ORDER BY created_at ASC, memory_id ASC""",
-            (tenant_id, repo_id, plane, now_iso),
+            (tenant_id, repo_id, plane, now_iso, now_iso),
         ).fetchall()
         return [MemoryRecord(*r) for r in rows]
 
-    def history(self, tenant_id, repo_id, key):
+    def history(self, tenant_id, repo_id, key,
+                plane="episodic"):
         rows = self.conn.execute(
             """SELECT memory_id, tenant_id, repo_id, plane,
                       key, content, source_event_id,
                       created_at, expires_at, status,
                       supersedes
                FROM memories
-               WHERE tenant_id=? AND repo_id=? AND key=?
+               WHERE tenant_id=? AND repo_id=? AND plane=?
+                 AND key=?
                ORDER BY created_at ASC""",
-            (tenant_id, repo_id, key),
+            (tenant_id, repo_id, plane, key),
         ).fetchall()
         return [MemoryRecord(*r) for r in rows]
 
@@ -132,46 +163,64 @@ POLICY_TOKENS = (
     "bypass approval", "disable sandbox",
 )
 
+def _event_ids(trace_events, tenant_id, repo_id):
+    valid = set()
+    for ev in trace_events:
+        if not isinstance(ev, dict):
+            continue
+        if ("tenant_id" in ev
+                and ev["tenant_id"] != tenant_id):
+            continue
+        if "repo_id" in ev and ev["repo_id"] != repo_id:
+            continue
+        if isinstance(ev.get("event_id"), str):
+            valid.add(ev["event_id"])
+        if "seq" in ev:
+            valid.add(f"seq:{ev['seq']}")
+    return valid
+
 def consolidate_memories(store, trace_events, candidates,
                          tenant_id, repo_id, now=None,
                          ttl_days=30):
     """Offline, provenance-gated memory consolidation."""
     now = now or dt.datetime.now(dt.timezone.utc)
-    valid_ids = {e.get("event_id") for e in trace_events
-                 if e.get("event_id")}
+    valid_ids = _event_ids(trace_events, tenant_id, repo_id)
     accepted, rejected = [], []
 
     for c in candidates:
+        if not isinstance(c, dict):
+            rejected.append(("?", "invalid candidate"))
+            continue
+        cid = str(c.get("memory_id", "?"))
         plane = c.get("plane", "episodic")
         src = c.get("source_event_id", "")
         text = c.get("content", "")
         if plane != "episodic":
             rejected.append(
-                (c.get("memory_id", "?"),
-                 f"cannot consolidate into {plane}"))
+                (cid, f"cannot consolidate into {plane}"))
             continue
-        if src not in valid_ids:
-            rejected.append(
-                (c.get("memory_id", "?"),
-                 "ungrounded provenance"))
+        if not isinstance(text, str) or not text.strip():
+            rejected.append((cid, "invalid content"))
             continue
-        low = text.lower()
-        if any(tok in low for tok in POLICY_TOKENS):
+        if not isinstance(src, str) or src not in valid_ids:
+            rejected.append((cid, "ungrounded provenance"))
+            continue
+        if any(tok in text.lower()
+               for tok in POLICY_TOKENS):
             rejected.append(
-                (c.get("memory_id", "?"),
-                 "policy-mutation phrase blocked"))
+                (cid, "policy-mutation phrase blocked"))
             continue
         rec = MemoryRecord(
-            memory_id=c["memory_id"],
+            memory_id=cid,
             tenant_id=tenant_id,
             repo_id=repo_id,
             plane="episodic",
-            key=c["key"],
+            key=str(c["key"]),
             content=text,
             source_event_id=src,
-            created_at=_iso(now),
-            expires_at=_iso(now + dt.timedelta(
-                days=ttl_days)),
+            created_at=_norm_iso(now),
+            expires_at=_norm_iso(
+                now + dt.timedelta(days=ttl_days)),
             supersedes=c.get("supersedes"),
         )
         if rec.supersedes:
@@ -221,6 +270,10 @@ def assemble_with_memory(contract, files, store,
         tail = ("STATE:\n"
                 + json.dumps(state, sort_keys=True))
     prompt = prefix + tail
+    if len(prompt) > char_budget:
+        raise OverBudget(
+            f"mandatory context {len(prompt)} > "
+            f"{char_budget}")
     return {
         "prompt": prompt,
         "prefix_hash": sha12(prefix),
@@ -238,15 +291,17 @@ def run_memory_probes():
     store = MemoryStore(":memory:")
 
     trace = [
-        {"event_id": "ev-01", "kind": "obs",
+        {"event_id": "ev-01", "tenant_id": "tenant-a",
+         "repo_id": "billing", "kind": "obs",
          "note": "discount cap was 20% in Q3"},
-        {"event_id": "ev-02", "kind": "obs",
+        {"event_id": "ev-02", "tenant_id": "tenant-a",
+         "repo_id": "billing", "kind": "obs",
          "note": "discount cap raised to 30% in Q4"},
-        {"event_id": "ev-03", "kind": "obs",
+        {"event_id": "ev-03", "tenant_id": "tenant-b",
+         "repo_id": "billing", "kind": "obs",
          "note": "other tenant billing rule"},
     ]
 
-    # Seed tenant-a / billing-repo and tenant-b / billing-repo
     r1 = consolidate_memories(
         store, trace,
         [{"memory_id": "mem-1", "key": "discount_cap",
@@ -263,7 +318,6 @@ def run_memory_probes():
         ttl_days=60,
     )
 
-    # Correction supersedes mem-1 without deleting trace/history
     r2 = consolidate_memories(
         store, trace,
         [

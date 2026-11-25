@@ -161,10 +161,53 @@ def test_ch7_task_ledger_persists_across_sessions(tmp_path):
     s2 = ch07.DurableStore(db)
     l2 = ch07.TaskLedger(s2)
     summary = l2.resume_summary("r-long")
-    assert summary["verified"] == ["m1"]
+    assert summary["verified"] == [{"id": "m1", "rev": "rev1"}]
     assert len(summary["remaining"]) == 1
     assert summary["remaining"][0]["id"] == "m2"
     s2.close()
+
+
+def test_ch7_codex_hardening_atomic_contract_order_budget_and_hostile_inputs():
+    store = ch07.DurableStore(":memory:")
+    r = ch07.DurableRunner(store)
+
+    # Blank/None run_id rejected
+    with pytest.raises(ValueError):
+        store.load_run(None, ch02.TASK_INVOICE)
+
+    # Out-of-order step_index rejected
+    with pytest.raises(ValueError, match="expected step 0"):
+        r.step("r-ord", ch02.TASK_INVOICE, ch02.WORKSPACE,
+               ch07._v4_fix_planner, 5)
+
+    # Hostile proposals ({'tool': []}, oversized 50KB) safely refused & bounded
+    _, res_bad = r.step("r-hostile", ch02.TASK_INVOICE, ch02.WORKSPACE,
+                        lambda run: {"tool": []}, 0)
+    assert "error" in res_bad
+    _, res_big = r.step("r-hostile", ch02.TASK_INVOICE, ch02.WORKSPACE,
+                        lambda run: {"tool": "read_lines",
+                                     "args": {"path": "x" * 50000}}, 1)
+    assert "size cap" in res_big["error"]
+    saved = store.get_step("r-hostile", 1)
+    assert len(str(saved["proposal"])) < 200
+
+    # Contract mismatch on load rejected
+    other = ch02.Contract(task_id="OTHER-99", goal="other")
+    with pytest.raises(ValueError, match="contract mismatch"):
+        store.load_run("r-hostile", other)
+
+    # Budget check prevents calling model past step cap
+    tiny = ch02.Contract(task_id="TINY", goal="t",
+                         budget=ch02.Budget(steps=1, edits=1))
+    r_tiny = ch07.DurableRunner(store)
+    r_tiny.step("r-tiny", tiny, ch02.WORKSPACE, ch07._v4_fix_planner, 0)
+    calls_at_cap = r_tiny.model_calls
+    run_cap, res_cap = r_tiny.step("r-tiny", tiny, ch02.WORKSPACE,
+                                   ch07._v4_fix_planner, 1)
+    assert r_tiny.model_calls == calls_at_cap
+    assert run_cap.state == "blocked"
+    assert "step budget" in res_cap["error"]
+    store.close()
 
 
 def test_ch7_benchmark_crash_recovery_beats_naive():
@@ -243,6 +286,39 @@ def test_ch8_cross_scope_supersede_is_blocked():
             expires_at="2026-12-02T00:00:00+00:00",
             supersedes="m1",
         ))
+    # Atomic rollback: colliding memory_id leaves m1 active
+    import sqlite3
+    with pytest.raises(sqlite3.IntegrityError):
+        store.supersede("m1", ch08.MemoryRecord(
+            memory_id="m1", tenant_id="tenant-a", repo_id="billing",
+            plane="episodic", key="k", content="v2",
+            source_event_id="ev-2",
+            created_at="2026-11-02T00:00:00+00:00",
+            expires_at="2026-12-02T00:00:00+00:00",
+            supersedes="m1",
+        ))
+    assert len(store.query("tenant-a", "billing",
+                           now=dt.datetime(2026, 11, 10,
+                                           tzinfo=dt.timezone.utc))) == 1
+
+    # UTC normalization: +02:00 expiry already passed at 00:00 UTC
+    store.put(ch08.MemoryRecord(
+        memory_id="m-tz", tenant_id="tenant-a", repo_id="billing",
+        plane="episodic", key="tz", content="short",
+        source_event_id="ev-1",
+        created_at="2026-11-01T00:00:00+00:00",
+        expires_at="2026-11-02T01:00:00+02:00",  # 2026-11-01T23:00Z
+    ))
+    at_mid = dt.datetime(2026, 11, 2, 0, 0, tzinfo=dt.timezone.utc)
+    ids = [m.memory_id for m in store.query("tenant-a", "billing", now=at_mid)]
+    assert "m-tz" not in ids
+
+    # Hard OverBudget when mandatory context exceeds cap
+    from ahe.ch03 import OverBudget
+    with pytest.raises(OverBudget):
+        ch08.assemble_with_memory(
+            ch02.TASK_INVOICE, ch02.WORKSPACE, store,
+            "tenant-a", "billing", char_budget=50, now=at_mid)
     store.close()
 
 
@@ -375,6 +451,7 @@ def test_ch9_a2a_server_card_and_opaque_task_lifecycle():
 
 def test_ch9_recorded_live_evaluator_probe_matches_claims():
     import json
+    from ahe import ch01
     path = (Path(__file__).resolve().parents[1]
             / "runs" / "v2_ch09_evaluator_gpt-6-luna.jsonl")
     recs = [json.loads(line) for line in path.read_text().splitlines()
@@ -383,8 +460,54 @@ def test_ch9_recorded_live_evaluator_probe_matches_claims():
     outs = [r["outcome"] for r in recs if "outcome" in r]
     assert len(calls) == 10
     assert len(outs) == 5
-    assert all(not o["coupled_passed"] for o in outs)
-    assert all(not o["isolated_passed"] for o in outs)
-    assert all(not o["harness_passed"]
-               and o["harness_failed"] == ["invoice_none"]
-               for o in outs)
+    # True replay: recompute parsed verdicts from raw model replies
+    for idx in range(5):
+        p_coupled = ch01.parse_json(calls[idx * 2]["reply"]) or {}
+        p_iso = ch01.parse_json(calls[idx * 2 + 1]["reply"]) or {}
+        assert bool(p_coupled.get("passed")) is False
+        assert bool(p_iso.get("passed")) is False
+        assert outs[idx]["harness_passed"] is False
+        assert outs[idx]["harness_failed"] == ["invoice_none"]
+
+
+def test_ch9_codex_hardening_empty_tools_deletion_restore_and_a2a_errors():
+    ws = ch09.make_noisy_workspace()
+    ctrl = ch09.DelegationController(
+        ch09.SubAgentBudget(max_output_chars=40))
+
+    # Explicit empty requested_tools=[] must NOT fall back to defaults
+    empty = ctrl.delegate(ws, ch02.TASK_INVOICE, ["list_files"],
+                          "g", ch09._readonly_inspector,
+                          requested_tools=[])
+    assert empty["error"] == "no permitted read-only tools"
+
+    # Oversized summary is actually truncated to max_output_chars=40
+    big = ctrl.delegate(ws, ch02.TASK_INVOICE, ["finish"], "g",
+                        lambda r, g: {"tool": "finish", "args": {},
+                                      "summary": "A" * 200})
+    assert len(big["summary"]) == 40
+    assert big["child_steps"] == 1
+
+    # Generator deleting tests/test_pricing.py has it restored from baseline
+    def deleter(files, fb, rnd):
+        return {"pricing.py": ch02.PRICING_FIXED,
+                "invoice.py": ch02.INVOICE_FIXED}  # omitted tests/
+
+    res = ch09.generator_evaluator_loop(
+        ch02.TASK_INVOICE, ch02.WORKSPACE, deleter, max_rounds=1)
+    assert "tests/test_pricing.py" in res["files"]
+    assert res["files"]["tests/test_pricing.py"] == (
+        ch02.WORKSPACE["tests/test_pricing.py"])
+
+    # A2AServer rejects non-dict params, non-str id, and masks raw errors
+    srv = ch09.A2AServer(ch09.AgentCard("a", "1"),
+                         lambda s, i: (_ for _ in ()).throw(
+                             RuntimeError("secret db pw")))
+    assert srv.handle({"jsonrpc": "2.0", "id": 1, "method": "tasks/send",
+                       "params": [1]})["error"]["code"] == -32602
+    assert srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tasks/get",
+                       "params": {"id": []}})["error"]["code"] == -32602
+    fail = srv.handle({"jsonrpc": "2.0", "id": 3, "method": "tasks/send",
+                       "params": {"skill": "workspace.inspect", "input": {}}})
+    assert fail["result"]["state"] == "failed"
+    assert "secret db pw" not in fail["result"]["error"]
